@@ -5,32 +5,39 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use nix_bindings::{Context, EvalState, EvalStateBuilder, Store, Value};
+use tracing::{debug, trace, warn};
 
-use crate::{Args, eval};
+use crate::{AutoArg, Config, Input};
 
-pub fn run_worker(args: &Args) -> Result<()> {
+#[allow(clippy::arc_with_non_send_sync)]
+pub fn run() -> Result<()> {
+    let config = read_config()?;
+    debug!("worker initialized");
+
     let ctx = Arc::new(Context::new().context("Nix context")?);
     let store = Arc::new(Store::open(&ctx, None).context("Nix store")?);
-    let state = build_eval_state(&ctx, &store, args)?;
-    let auto_args = build_auto_args(&state, &args.arg, &args.argstr)?;
+    let state = build_eval_state(&ctx, &store, &config)?;
+    let auto_args = build_auto_args(&state, &config.auto_args)?;
     let auto_ref = auto_args.as_ref();
 
-    let root = eval_root(&ctx, &state, args, auto_ref)?;
+    let root = eval_root(&ctx, &state, &config, auto_ref)?;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
-    loop {
-        writeln!(stdout, "next")?;
-        stdout.flush()?;
+    writeln!(stdout, "ready")?;
+    stdout.flush()?;
 
+    loop {
         let mut line = String::new();
         if stdin.lock().read_line(&mut line)? == 0 {
+            debug!("master closed stdin, worker exiting");
             break;
         }
         let cmd = line.trim_matches(['\n', '\r', ' ']);
 
         if cmd == "exit" {
+            debug!("received exit command, worker shutting down");
             break;
         }
         if !cmd.starts_with("do ") {
@@ -39,26 +46,44 @@ pub fn run_worker(args: &Args) -> Result<()> {
 
         let path: Vec<String> =
             serde_json::from_str(cmd[3..].trim()).context("parsing attr path from master")?;
+        let attr = path.join(".");
+        trace!(attr = %attr, "evaluating attribute");
 
-        let response = eval::process_attr(&state, &store, &root, &path, auto_ref, args);
+        let response = crate::eval::process_attr(&state, &store, &root, &path, auto_ref, &config);
         writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
         stdout.flush()?;
 
-        if should_restart(args.max_memory_size) {
+        if should_restart(config.max_memory_size) {
+            warn!(
+                max_rss_kb = get_maxrss_kb(),
+                "memory limit exceeded, worker restarting"
+            );
             writeln!(stdout, "restart")?;
             stdout.flush()?;
             return Ok(());
         }
+
+        writeln!(stdout, "ready")?;
+        stdout.flush()?;
     }
 
     Ok(())
 }
 
-fn build_eval_state(_ctx: &Arc<Context>, store: &Arc<Store>, args: &Args) -> Result<EvalState> {
+fn read_config() -> Result<Config> {
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line)? == 0 {
+        bail!("worker received no configuration line");
+    }
+    serde_json::from_str(line.trim()).context("parsing worker configuration")
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+fn build_eval_state(_ctx: &Arc<Context>, store: &Arc<Store>, config: &Config) -> Result<EvalState> {
     let mut builder = EvalStateBuilder::new(store).context("eval state builder")?;
 
     #[cfg(feature = "flake")]
-    if args.flake.is_some() {
+    if matches!(config.input, Input::Flake(_)) {
         let fs = nix_bindings::flake::FlakeSettings::new(_ctx).context("flake settings")?;
         builder = builder
             .with_flake_settings(&fs)
@@ -71,25 +96,26 @@ fn build_eval_state(_ctx: &Arc<Context>, store: &Arc<Store>, args: &Args) -> Res
 fn eval_root<'s>(
     ctx: &Arc<Context>,
     state: &'s EvalState,
-    args: &Args,
+    config: &Config,
     auto_args: Option<&Value<'s>>,
 ) -> Result<Value<'s>> {
-    if let Some(ref flake_ref) = args.flake {
-        eval_flake(ctx, state, flake_ref)
-    } else if let Some(ref expr) = args.expr {
-        let v = state
-            .eval_from_string(expr, "<cmdline>")
-            .context("evaluating expression")?;
-        Ok(state.auto_call_function(auto_args, &v)?)
-    } else if let Some(ref file) = args.file {
-        let v = state.eval_from_file(file).context("evaluating file")?;
-        Ok(state.auto_call_function(auto_args, &v)?)
-    } else {
-        bail!("no input specified")
+    match &config.input {
+        Input::Flake(flake_ref) => eval_flake(ctx, state, flake_ref),
+        Input::Expr(expr) => {
+            let v = state
+                .eval_from_string(expr, "<cmdline>")
+                .context("evaluating expression")?;
+            Ok(state.auto_call_function(auto_args, &v)?)
+        }
+        Input::File(file) => {
+            let v = state.eval_from_file(file).context("evaluating file")?;
+            Ok(state.auto_call_function(auto_args, &v)?)
+        }
     }
 }
 
 #[cfg(feature = "flake")]
+#[allow(clippy::arc_with_non_send_sync)]
 fn eval_flake<'s>(
     ctx: &Arc<Context>,
     state: &'s EvalState,
@@ -143,32 +169,23 @@ fn eval_flake<'s>(
 
 fn build_auto_args<'s>(
     state: &'s EvalState,
-    args: &[String],
-    argstrs: &[String],
+    args: &[(String, AutoArg)],
 ) -> Result<Option<Value<'s>>> {
-    if args.is_empty() && argstrs.is_empty() {
+    if args.is_empty() {
         return Ok(None);
     }
 
     let mut pairs: Vec<(String, Value<'s>)> = Vec::new();
 
-    for chunk in args.chunks(2) {
-        let [name, expr] = chunk else {
-            bail!("--arg: expected NAME EXPR pair")
+    for (name, arg) in args {
+        let val = match arg {
+            AutoArg::Expr(expr) => state
+                .eval_from_string(expr, "<arg>")
+                .with_context(|| format!("--arg {name}"))?,
+            AutoArg::Str(s) => state
+                .make_string(s)
+                .with_context(|| format!("--argstr {name}"))?,
         };
-        let val = state
-            .eval_from_string(expr, "<arg>")
-            .with_context(|| format!("--arg {name}"))?;
-        pairs.push((name.clone(), val));
-    }
-
-    for chunk in argstrs.chunks(2) {
-        let [name, s] = chunk else {
-            bail!("--argstr: expected NAME VALUE pair")
-        };
-        let val = state
-            .make_string(s)
-            .with_context(|| format!("--argstr {name}"))?;
         pairs.push((name.clone(), val));
     }
 

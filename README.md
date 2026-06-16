@@ -2,15 +2,16 @@
 
 [nix-bindings]: https://github.com/notashelf/nix-bindings
 
-Experimental CLI utility using [nix-bindings] for the Nix C API, and a Rust
-replacement for nix-eval-jobs in Rust to leverage language features, and
-evaluate Nix expressions and stream derivation info as JSON lines _in style_.
+A library-first Rust crate using [nix-bindings] for the Nix C API to evaluate
+Nix expressions and stream derivation info as JSON lines. It ships with a small
+CLI, but the evaluation logic is exposed as a reusable library so other tools
+can drive it programmatically.
 
 ## Why evix?
 
-- Faster evaluation by using threads
-- Memory used for evaluation is reclaimed after nix-eval-jobs finish, so that
-  the build can use it.
+- Faster evaluation by using multiple worker processes
+- Memory used for evaluation is reclaimed when workers restart, so the build can
+  use it.
 - Evaluation of jobs can fail individually
 - It's really cool!
 
@@ -50,8 +51,14 @@ copying path '/nix/store/jfdpyszsgvsnz68y36qi65irx7r6a52q-source' from 'https://
 | `--max-memory-size MB` | Memory limit per worker; restarts when exceeded (default: 4096) |
 | `--force-recurse`      | Recurse into all attrsets, ignoring `recurseForDerivations`     |
 | `--gc-roots-dir DIR`   | Register GC root symlinks for evaluated derivations             |
+| `-v`, `--verbose`      | Increase logging verbosity (info -> debug -> trace)             |
 
 <!--markdownlint-enable MD013-->
+
+Logging is powered by [`tracing`](https://docs.rs/tracing). The default level is
+`info`; use `-v` for `debug` and `-vv` for `trace`. The `RUST_LOG` environment
+variable overrides `--verbose` if set. Logs are written to stderr so they do not
+interfere with the JSON output on stdout.
 
 ## Output
 
@@ -86,15 +93,34 @@ Errors are non-fatal unless `"fatal": true`:
 
 ## Architecture
 
-The binary operates in two modes based on the `_NEJ_WORKER` environment
-variable:
+The library splits work between a master and worker processes. The master
+maintains a queue of attribute paths, dispatches them to workers over
+stdin/stdout, and collects [`Event`](src/lib.rs) values. Workers are restarted
+automatically when they exceed the configured memory limit.
 
-- **Master** (default): Spawns worker subprocesses, manages a work queue of attr
-  paths, distributes work via stdin/stdout, and collects results.
-- **Worker** (`_NEJ_WORKER=1`): Evaluates Nix expressions, processes individual
-  attr paths, and signals when memory limits are reached.
+The CLI is a thin wrapper around the library. When the library spawns a worker,
+it re-executes the current binary with the `EVIX_WORKER` environment variable
+set; the binary then calls the worker entrypoint.
 
-Workers are restarted automatically when they exceed the memory limit.
+## Library usage
+
+```rust
+use evix::{Config, Event, Input};
+
+let config = Config {
+    input: Input::Expr("import <nixpkgs> {}".into()),
+    auto_args: vec![],
+    force_recurse: false,
+    gc_roots_dir: None,
+    workers: 4,
+    max_memory_size: 4096,
+};
+
+evix::evaluate(&config, |event| {
+    println!("{:?}", event);
+    Ok(())
+})?;
+```
 
 ## Building
 

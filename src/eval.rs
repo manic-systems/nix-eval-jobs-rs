@@ -1,10 +1,10 @@
-use std::path::PathBuf;
+use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result};
 use nix_bindings::{EvalState, Store, Value, ValueType};
-use serde_json::{Value as Json, json};
+use tracing::{debug, warn};
 
-use crate::Args;
+use crate::{Config, EvalError, Event};
 
 pub fn process_attr<'s>(
     state: &'s EvalState,
@@ -12,35 +12,54 @@ pub fn process_attr<'s>(
     root: &Value<'s>,
     path: &[String],
     auto_args: Option<&Value<'s>>,
-    args: &Args,
-) -> Json {
+    config: &Config,
+) -> Event {
     let attr = path.join(".");
 
     let value = match navigate(state, root, path, auto_args) {
         Ok(v) => v,
         Err(e) => {
-            return json!({"attr": attr, "attrPath": path, "error": e.to_string(), "fatal": false});
+            return Event::Error(EvalError {
+                attr,
+                attr_path: path.to_vec(),
+                error: e.to_string(),
+                fatal: false,
+            });
         }
     };
 
     if value.value_type() != ValueType::Attrs {
-        return json!({"attr": attr, "attrPath": path, "attrs": []});
+        return Event::AttrSet {
+            attr,
+            attr_path: path.to_vec(),
+            attrs: vec![],
+        };
     }
 
     match state.get_derivation(&value) {
-        Ok(Some(drv_path)) => match make_job(store, &value, path, drv_path, args) {
-            Ok(j) => j,
-            Err(e) => {
-                json!({"attr": attr, "attrPath": path, "error": e.to_string(), "fatal": false})
-            }
+        Ok(Some(drv_path)) => match make_job(store, &value, path, drv_path, config) {
+            Ok(ev) => ev,
+            Err(e) => Event::Error(EvalError {
+                attr,
+                attr_path: path.to_vec(),
+                error: e.to_string(),
+                fatal: false,
+            }),
         },
         Ok(None) => {
-            let children = collect_recurse(&value, path, args.force_recurse);
-            json!({"attr": attr, "attrPath": path, "attrs": children})
+            let children = collect_recurse(&value, path, config.force_recurse);
+            Event::AttrSet {
+                attr,
+                attr_path: path.to_vec(),
+                attrs: children,
+            }
         }
-        Err(e) => {
-            json!({"attr": attr, "attrPath": path, "error": e.to_string(), "fatal": false})
-        }
+        Err(e) => Event::Error(EvalError {
+            attr,
+            attr_path: path.to_vec(),
+            error: e.to_string(),
+            fatal: false,
+        }),
     }
 }
 
@@ -93,8 +112,8 @@ fn make_job(
     value: &Value<'_>,
     path: &[String],
     drv_path: nix_bindings::StorePath,
-    args: &Args,
-) -> Result<Json> {
+    config: &Config,
+) -> Result<Event> {
     let attr = path.join(".");
     let drv_path_str = store.print_path(&drv_path).context("printing drv path")?;
 
@@ -108,29 +127,33 @@ fn make_job(
         .unwrap_or_default();
     let outputs = output_paths(value);
 
-    if let Some(ref gc_dir) = args.gc_roots_dir {
-        if let Err(e) = register_gc_root(gc_dir, &drv_path_str) {
-            eprintln!("warning: gc root for {drv_path_str}: {e}");
-        }
-    }
+    let gc_root_error = config.gc_roots_dir.as_ref().and_then(|dir| {
+        register_gc_root(dir, &drv_path_str).err().map(|e| {
+            warn!(drv_path = %drv_path_str, error = %e, "failed to register gc root");
+            e.to_string()
+        })
+    });
 
-    Ok(json!({
-        "attr": attr,
-        "attrPath": path,
-        "name": name,
-        "system": system,
-        "drvPath": drv_path_str,
-        "outputs": outputs,
+    debug!(name = %name, drv_path = %drv_path_str, "found derivation");
+
+    Ok(Event::Derivation(crate::Derivation {
+        attr,
+        attr_path: path.to_vec(),
+        name,
+        system,
+        drv_path: drv_path_str,
+        outputs,
+        gc_root_error,
     }))
 }
 
-fn output_paths(value: &Value<'_>) -> Json {
-    let mut map = serde_json::Map::new();
+fn output_paths(value: &Value<'_>) -> BTreeMap<String, Option<String>> {
+    let mut map = BTreeMap::new();
     let Ok(list) = value.get_attr("outputs") else {
-        return Json::Object(map);
+        return map;
     };
     let Ok(len) = list.list_len() else {
-        return Json::Object(map);
+        return map;
     };
     for i in 0..len {
         let Ok(name_val) = list.list_get(i) else {
@@ -144,12 +167,12 @@ fn output_paths(value: &Value<'_>) -> Json {
                 .ok()
                 .or_else(|| out.as_path().map(|p| p.to_string_lossy().into_owned()).ok())
         });
-        map.insert(name, path.map(Json::String).unwrap_or(Json::Null));
+        map.insert(name, path);
     }
-    Json::Object(map)
+    map
 }
 
-fn register_gc_root(gc_dir: &PathBuf, drv_path: &str) -> Result<()> {
+fn register_gc_root(gc_dir: &std::path::Path, drv_path: &str) -> Result<()> {
     let name = std::path::Path::new(drv_path)
         .file_name()
         .context("drv path has no filename")?;
