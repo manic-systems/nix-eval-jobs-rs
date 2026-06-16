@@ -190,6 +190,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
+name = "evix"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "nix-bindings",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -281,18 +293,6 @@ dependencies = [
  "cc",
  "doxygen-bindgen",
  "pkg-config",
-]
-
-[[package]]
-name = "nix-eval-jobs-rs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "nix-bindings",
- "serde",
- "serde_json",
 ]
 
 [[package]]

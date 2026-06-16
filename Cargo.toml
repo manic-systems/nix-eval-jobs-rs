@@ -1,5 +1,5 @@
 [package]
-name = "nix-eval-jobs-rs"
+name = "evix"
 description = "Evaluate a Nix expression and stream derivation info as JSON lines"
 edition = "2024"
 version = "0.1.0"

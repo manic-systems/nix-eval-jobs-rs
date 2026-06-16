@@ -16,7 +16,7 @@ let
   nixForBindings = nixVersions.nix_2_34;
 in
 mkShell {
-  name = "nix-eval-jobs";
+  name = "evix";
 
   strictDeps = true;
   nativeBuildInputs = [

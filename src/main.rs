@@ -10,8 +10,7 @@ use clap::{ArgGroup, Parser};
 pub const WORKER_ENV: &str = "_NEJ_WORKER";
 
 #[derive(Parser, Clone)]
-#[command(name = "nix-eval-jobs")]
-#[command(about = "Evaluate a Nix attrset and emit one JSON line per derivation")]
+#[command(name = "evix", about = "Evaluate a Nix attrset and emit one JSON line per derivation")]
 #[command(group(ArgGroup::new("input").required(true).args(["flake", "expr", "file"])))]
 pub struct Args {
     /// Evaluate a flake output (e.g. `.#hydraJobs`).

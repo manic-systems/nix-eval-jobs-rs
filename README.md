@@ -1,4 +1,4 @@
-# nix-eval-jobs-rs
+# evix
 
 [nix-bindings]: https://github.com/notashelf/nix-bindings
 
@@ -6,7 +6,7 @@ Experimental CLI utility using [nix-bindings] for the Nix C API, and a Rust
 replacement for nix-eval-jobs in Rust to leverage language features, and
 evaluate Nix expressions and stream derivation info as JSON lines _in style_.
 
-## Why nix-eval-jobs-rs?
+## Why evix?
 
 - Faster evaluation by using threads
 - Memory used for evaluation is reclaimed after nix-eval-jobs finish, so that
@@ -19,14 +19,14 @@ evaluate Nix expressions and stream derivation info as JSON lines _in style_.
 Exactly one input is required:
 
 ```bash
-nix-eval-jobs --flake .#hydraJobs
-nix-eval-jobs --expr 'import <nixpkgs> {}'
-nix-eval-jobs --file ./default.nix
+evix --flake .#hydraJobs
+evix --expr 'import <nixpkgs> {}'
+evix --file ./default.nix
 ```
 
 ```bash
 # Evaluate the hydraJobs attribute of the patchelf flake
-$ nix-eval-jobs-rs --flake 'github:NixOS/patchelf#hydraJobs'
+$ evix --flake 'github:NixOS/patchelf#hydraJobs'
 copying path '/nix/store/jfdpyszsgvsnz68y36qi65irx7r6a52q-source' from 'https://cache.nixos.org'...
 {"attr":"tarball","attrPath":["tarball"],"drvPath":"/nix/store/dbhsb9ji8ya2js87v1q5621lx87smw3l-patchelf-tarball-0.18.0.drv","name":"patchelf-tarball-0.18.0","outputs":{"out":null},"system":"x86_64-linux"}
 {"attr":"coverage","attrPath":["coverage"],"drvPath":"/nix/store/h8fzgxxddi1470vad93j2y5s1lyxsii8-patchelf-coverage-0.18.0.drv","name":"patchelf-coverage-0.18.0","outputs":{"out":null},"system":"x86_64-linux"}

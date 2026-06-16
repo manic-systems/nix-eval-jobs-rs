@@ -3,7 +3,7 @@
   rustPlatform,
 }:
 rustPlatform.buildRustPackage (finalAttrs: {
-  pname = "nix-eval-jobs-rs";
+  pname = "evix";
   version = "0.1.0";
 
   src = let
@@ -24,7 +24,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   meta = {
     description = "Evaluate a Nix expression and stream derivation info as JSON lines";
-    mainProgram = "nix-eval-jobs";
+    mainProgram = "evix";
     license = lib.licenses.eupl12;
     maintainers = with lib.maintainers; [NotAShelf];
   };
