@@ -1,7 +1,15 @@
 {
   lib,
   rustPlatform,
+  glibc,
+  nixVersions,
+  pkg-config,
+  rustc,
 }:
+let
+  inherit (rustc) llvmPackages;
+  nixForBindings = nixVersions.latest;
+in
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "evix";
   version = "0.1.0";
@@ -21,6 +29,20 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   cargoLock.lockFile = "${finalAttrs.src}/Cargo.lock";
   enableParallelBuilding = true;
+
+  nativeBuildInputs = [
+    pkg-config
+  ];
+
+  buildInputs = [
+    nixForBindings.dev
+    glibc.dev
+  ];
+
+  env = {
+    LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+    BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=${glibc.dev}";
+  };
 
   meta = {
     description = "Evaluate a Nix expression and stream derivation info as JSON lines";
