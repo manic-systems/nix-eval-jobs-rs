@@ -173,7 +173,7 @@ fn read_meta(value: &Value<'_>) -> Option<serde_json::Value> {
         return None;
     }
     let meta = value.get_attr("meta").ok()?;
-    value_to_json(meta)
+    value_to_json(meta, 64)
 }
 
 /// Recursively convert a Nix value to JSON, forcing each node on entry.
@@ -182,8 +182,12 @@ fn read_meta(value: &Value<'_>) -> Option<serde_json::Value> {
 ///
 /// The value as JSON, or `None` if the node fails to force or has no JSON
 /// analogue (thunks that error, functions, external values).
-fn value_to_json(mut value: Value<'_>) -> Option<serde_json::Value> {
+fn value_to_json(mut value: Value<'_>, depth_remaining: u32) -> Option<serde_json::Value> {
     use serde_json::Value as J;
+
+    if depth_remaining == 0 {
+        return None;
+    }
 
     value.force().ok()?;
     match value.value_type() {
@@ -205,7 +209,7 @@ fn value_to_json(mut value: Value<'_>) -> Option<serde_json::Value> {
             let mut arr = Vec::with_capacity(len);
             for i in 0..len {
                 let item = value.list_get(i).ok()?;
-                arr.push(value_to_json(item).unwrap_or(J::Null));
+                arr.push(value_to_json(item, depth_remaining - 1).unwrap_or(J::Null));
             }
             Some(J::Array(arr))
         }
@@ -214,7 +218,7 @@ fn value_to_json(mut value: Value<'_>) -> Option<serde_json::Value> {
             let mut map = serde_json::Map::new();
             for key in keys {
                 if let Ok(child) = value.get_attr(&key)
-                    && let Some(child_json) = value_to_json(child)
+                    && let Some(child_json) = value_to_json(child, depth_remaining - 1)
                 {
                     map.insert(key, child_json);
                 }
