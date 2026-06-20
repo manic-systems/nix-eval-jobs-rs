@@ -2,8 +2,12 @@ use std::{
     env, io,
     io::{BufRead, BufReader, Write},
     process::{Child, Command, Stdio},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -11,13 +15,17 @@ use tracing::{debug, error, info, trace};
 
 use crate::{Config, EvalError, Event, WORKER_ENV};
 
+/// How often a collector parked waiting for work re-checks the cancellation
+/// flag.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 struct SharedState {
     todo: Vec<Vec<String>>,
     active: usize,
     error: Option<String>,
 }
 
-pub fn run<F>(config: &Config, sink: Arc<Mutex<F>>) -> Result<()>
+pub fn run<F>(config: &Config, cancel: &Arc<AtomicBool>, sink: Arc<Mutex<F>>) -> Result<()>
 where
     F: FnMut(&Event) -> Result<()> + Send + 'static,
 {
@@ -35,8 +43,11 @@ where
     for _ in 0..n {
         let shared = Arc::clone(&shared);
         let sink = Arc::clone(&sink);
+        let cancel = Arc::clone(cancel);
         let config = config.clone();
-        handles.push(thread::spawn(move || collector(&config, shared, sink)));
+        handles.push(thread::spawn(move || {
+            collector(&config, &cancel, shared, sink)
+        }));
     }
 
     for h in handles {
@@ -54,6 +65,7 @@ where
 
 fn collector<F>(
     config: &Config,
+    cancel: &Arc<AtomicBool>,
     shared: Arc<(Mutex<SharedState>, Condvar)>,
     sink: Arc<Mutex<F>>,
 ) -> Result<()>
@@ -68,6 +80,12 @@ where
         let path = {
             let mut s = lock.lock().unwrap();
             loop {
+                if cancel.load(Ordering::Relaxed) {
+                    writeln!(child_stdin, "exit")?;
+                    child_stdin.flush()?;
+                    info!("cancellation requested, collector exiting");
+                    return Ok(());
+                }
                 if let Some(ref e) = s.error {
                     let msg = e.clone();
                     writeln!(child_stdin, "exit")?;
@@ -87,7 +105,10 @@ where
                     info!("evaluation queue empty, exiting worker");
                     return Ok(());
                 }
-                s = cvar.wait(s).unwrap();
+                // Park until new work arrives, but wake periodically so a
+                // cancellation request is observed even when no events flow.
+                let (guard, _timeout) = cvar.wait_timeout(s, CANCEL_POLL_INTERVAL).unwrap();
+                s = guard;
             }
         };
 
