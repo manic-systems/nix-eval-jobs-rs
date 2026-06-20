@@ -169,12 +169,15 @@ where
 
 /// Like [`evaluate`], but observes a cancellation flag.
 ///
-/// When `cancel` is set to `true` the master stops dispatching new work, signals
-/// its workers to exit, and returns `Ok(())` once they have wound down. A worker
-/// already evaluating a single attribute runs to the end of that attribute
-/// before observing the request, so cancellation is cooperative rather than an
-/// immediate hard kill. This lets a caller enforce a wall-clock timeout without
-/// leaking worker processes.
+/// Setting `cancel` makes the master stop dispatching work and tell its workers
+/// to exit. Cancellation is cooperative: a worker already evaluating an
+/// attribute finishes it before observing the request, so a caller can enforce a
+/// wall-clock timeout without leaking worker processes.
+///
+/// # Errors
+///
+/// Returns an error if a worker reports a fatal evaluation error, if a worker
+/// process fails unexpectedly, or if `sink` returns an error.
 pub fn evaluate_cancellable<F>(
     config: &Config,
     cancel: &Arc<AtomicBool>,
