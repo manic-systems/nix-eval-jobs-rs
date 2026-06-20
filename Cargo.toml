@@ -1,21 +1,23 @@
 [package]
-name = "evix"
-description = "Evaluate a Nix expression and stream derivation info as JSON lines"
-edition = "2024"
-version = "0.3.1"
+name         = "evix"
+description  = "Evaluate a Nix expression and stream derivation info as JSON lines"
+edition      = "2024"
+version      = "0.3.1"
 rust-version = "1.90.0"
-license = "EUPL-1.2"
+license      = "EUPL-1.2"
+repository   = "https://github.com/manic-systems/evix"
+readme       = true
 
 [features]
-default = ["flake"]
-flake = ["nix-bindings/flake"]
+default = [ "flake" ]
+flake   = [ "nix-bindings/flake" ]
 
 [dependencies]
-nix-bindings = { version = "0.2347.4", features = ["full"] }
-anyhow = "1.0.12"
-libc = "0.2.186"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-pound = "0.1.6"
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+anyhow             = "1.0.12"
+libc               = "0.2.186"
+nix-bindings       = { version = "0.2347.4", features = [ "full" ] }
+pound              = "0.1.6"
+serde              = { version = "1.0.228", features = [ "derive" ] }
+serde_json         = "1.0.150"
+tracing            = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = [ "env-filter" ] }
