@@ -40,18 +40,22 @@ copying path '/nix/store/jfdpyszsgvsnz68y36qi65irx7r6a52q-source' from 'https://
 
 <!--markdownlint-disable MD013-->
 
-| Flag                   | Description                                                     |
-| ---------------------- | --------------------------------------------------------------- |
-| `--flake REF`          | Evaluate a flake output                                         |
-| `--expr EXPR`          | Evaluate an inline Nix expression                               |
-| `--file PATH`          | Evaluate a Nix file                                             |
-| `--arg NAME EXPR`      | Pass a Nix expression argument                                  |
-| `--argstr NAME VALUE`  | Pass a string argument                                          |
-| `--workers N`          | Worker processes (default: 1)                                   |
-| `--max-memory-size MB` | Memory limit per worker; restarts when exceeded (default: 4096) |
-| `--force-recurse`      | Recurse into all attrsets, ignoring `recurseForDerivations`     |
-| `--gc-roots-dir DIR`   | Register GC root symlinks for evaluated derivations             |
-| `-v`, `--verbose`      | Increase logging verbosity (info -> debug -> trace)             |
+| Flag                        | Description                                                              |
+| --------------------------- | ------------------------------------------------------------------------ |
+| `--flake REF`               | Evaluate a flake output                                                  |
+| `--expr EXPR`               | Evaluate an inline Nix expression                                        |
+| `--file PATH`               | Evaluate a Nix file                                                      |
+| `--arg NAME EXPR`           | Pass a Nix expression argument                                           |
+| `--argstr NAME VALUE`       | Pass a string argument                                                   |
+| `--override-input NAME REF` | Override a flake input while locking (flake inputs only)                 |
+| `--option KEY VALUE`        | Set a Nix setting (e.g. `restrict-eval`, `allow-import-from-derivation`) |
+| `--meta`                    | Attach each derivation's `meta` attribute to the output                  |
+| `--show-input-drvs`         | Attach each derivation's input derivations (`inputDrvs`)                 |
+| `--workers N`               | Worker processes (default: 1)                                            |
+| `--max-memory-size MB`      | Memory limit per worker; restarts when exceeded (default: 4096)          |
+| `--force-recurse`           | Recurse into all attrsets, ignoring `recurseForDerivations`              |
+| `--gc-roots-dir DIR`        | Register GC root symlinks for evaluated derivations                      |
+| `-v`, `--verbose`           | Increase logging verbosity (info -> debug -> trace)                      |
 
 <!--markdownlint-enable MD013-->
 
@@ -73,6 +77,27 @@ Each line is a JSON object. Derivation attributes emit:
   "drvPath": "/nix/store/...",
   "outputs": { "out": "/nix/store/..." }
 }
+```
+
+With `--meta`, the derivation's `meta` attribute is attached verbatim as a
+`meta` object. With `--show-input-drvs`, input derivations are attached as
+`inputDrvs`, keyed by absolute `.drv` store path with their output-name lists:
+
+```json
+{
+  "attr": "hello",
+  "drvPath": "/nix/store/...-hello.drv",
+  "outputs": { "out": "/nix/store/...-hello" },
+  "meta": { "description": "...", "license": { "spdxId": "GPL-3.0-or-later" } },
+  "inputDrvs": { "/nix/store/...-stdenv-linux.drv": ["out"] }
+}
+```
+
+Aggregate jobs that declare `constituents` emit them as a list of attribute
+names:
+
+```json
+{ "attr": "release", "drvPath": "...", "constituents": ["hello", "world"] }
 ```
 
 Non-derivation attrsets emit child attribute names for further recursion:
@@ -114,6 +139,10 @@ let config = Config {
     gc_roots_dir: None,
     workers: 4,
     max_memory_size: 4096,
+    meta: false,
+    show_input_drvs: false,
+    override_inputs: vec![],
+    nix_options: vec![],
 };
 
 evix::evaluate(&config, |event| {
