@@ -33,6 +33,22 @@ struct Args {
     #[pound(long)]
     argstr: Vec<String>,
 
+    /// Override a flake input (`--override-input NAME --override-input REF` pairs).
+    #[pound(long)]
+    override_input: Vec<String>,
+
+    /// Set a Nix setting (`--option KEY --option VALUE` pairs).
+    #[pound(long)]
+    option: Vec<String>,
+
+    /// Attach each derivation's `meta` attribute to the output.
+    #[pound(long)]
+    meta: bool,
+
+    /// Attach each derivation's input derivations (`inputDrvs`) to the output.
+    #[pound(long)]
+    show_input_drvs: bool,
+
     /// Number of worker processes.
     #[pound(long, default = "1")]
     workers: usize,
@@ -84,6 +100,28 @@ impl Args {
             auto_args.push((name.clone(), AutoArg::Str(value.clone())));
         }
 
+        let mut override_inputs = Vec::new();
+        for chunk in self.override_input.chunks(2) {
+            let [name, value] = chunk else {
+                eprintln!(
+                    "--override-input requires paired NAME REF values: use --override-input NAME --override-input REF"
+                );
+                process::exit(2);
+            };
+            override_inputs.push((name.clone(), value.clone()));
+        }
+
+        let mut nix_options = Vec::new();
+        for chunk in self.option.chunks(2) {
+            let [key, value] = chunk else {
+                eprintln!(
+                    "--option requires paired KEY VALUE values: use --option KEY --option VALUE"
+                );
+                process::exit(2);
+            };
+            nix_options.push((key.clone(), value.clone()));
+        }
+
         Config {
             input,
             auto_args,
@@ -91,6 +129,10 @@ impl Args {
             gc_roots_dir: self.gc_roots_dir.clone(),
             workers: self.workers,
             max_memory_size: self.max_memory_size,
+            meta: self.meta,
+            show_input_drvs: self.show_input_drvs,
+            override_inputs,
+            nix_options,
         }
     }
 
@@ -152,14 +194,24 @@ fn format_event(event: &Event) -> String {
                     v.as_ref().map_or(Json::Null, |p| Json::String(p.clone())),
                 );
             }
-            json!({
-                "attr": d.attr,
-                "attrPath": d.attr_path,
-                "name": d.name,
-                "system": d.system,
-                "drvPath": d.drv_path,
-                "outputs": outputs,
-            })
+            let mut obj = Map::new();
+            obj.insert("attr".into(), json!(d.attr));
+            obj.insert("attrPath".into(), json!(d.attr_path));
+            obj.insert("name".into(), json!(d.name));
+            obj.insert("system".into(), json!(d.system));
+            obj.insert("drvPath".into(), json!(d.drv_path));
+            obj.insert("outputs".into(), Json::Object(outputs));
+            if let Some(meta) = &d.meta {
+                obj.insert("meta".into(), meta.clone());
+            }
+            if !d.input_drvs.is_empty() {
+                let drvs: Map<String, Json> = d.input_drvs.clone().into_iter().collect();
+                obj.insert("inputDrvs".into(), Json::Object(drvs));
+            }
+            if let Some(constituents) = &d.constituents {
+                obj.insert("constituents".into(), json!(constituents));
+            }
+            Json::Object(obj)
         }
         Event::AttrSet {
             attr,
