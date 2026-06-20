@@ -1,58 +1,56 @@
 use std::io::Write;
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
+use std::{env, process};
 
 use anyhow::Result;
-use clap::{ArgGroup, Parser};
 use serde_json::{Map, Value as Json, json};
 use tracing::{info, warn};
 
 use evix::{AutoArg, Config, Event, Input, WORKER_ENV};
+use pound::Parse;
 
-#[derive(Parser, Clone)]
-#[command(
-    name = "evix",
-    about = "Evaluate a Nix attrset and emit one JSON line per derivation"
-)]
-#[command(group(ArgGroup::new("input").required(true).args(["flake", "expr", "file"])))]
+/// Evaluate a Nix attrset and emit one JSON line per derivation.
+#[derive(Parse, Clone)]
+#[pound(name = "evix", required_group = "input")]
 struct Args {
     /// Evaluate a flake output (e.g. `.#hydraJobs`).
-    #[arg(long)]
+    #[pound(long, group = "input")]
     flake: Option<String>,
 
     /// Evaluate an inline Nix expression.
-    #[arg(long)]
+    #[pound(long, group = "input")]
     expr: Option<String>,
 
     /// Evaluate a Nix file.
-    #[arg(long)]
+    #[pound(long, group = "input")]
     file: Option<PathBuf>,
 
-    /// Pass a Nix expression as an argument: `--arg NAME EXPR`.
-    #[arg(long = "arg", value_names = ["NAME", "EXPR"], num_args = 2, action = clap::ArgAction::Append)]
+    /// Pass a Nix expression as an argument (`--arg NAME --arg EXPR` pairs).
+    #[pound(long)]
     arg: Vec<String>,
 
-    /// Pass a string value as an argument: `--argstr NAME VALUE`.
-    #[arg(long = "argstr", value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
+    /// Pass a string value as an argument (`--argstr NAME --argstr VALUE` pairs).
+    #[pound(long)]
     argstr: Vec<String>,
 
     /// Number of worker processes.
-    #[arg(long, default_value_t = 1)]
+    #[pound(long, default = "1")]
     workers: usize,
 
     /// Memory limit per worker in MB; worker restarts when exceeded.
-    #[arg(long, default_value_t = 4096)]
+    #[pound(long, default = "4096")]
     max_memory_size: usize,
 
     /// Recurse into all attrsets, ignoring recurseForDerivations.
-    #[arg(long)]
+    #[pound(long)]
     force_recurse: bool,
 
     /// Directory in which to register GC roots for evaluated derivations.
-    #[arg(long)]
+    #[pound(long)]
     gc_roots_dir: Option<PathBuf>,
 
     /// Increase logging verbosity. Use multiple times for more detail.
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[pound(short, long, count)]
     verbose: u8,
 }
 
@@ -65,16 +63,24 @@ impl Args {
         } else if let Some(file) = &self.file {
             Input::File(file.clone())
         } else {
-            unreachable!("clap requires one input source")
+            unreachable!("pound requires one of --flake, --expr, --file")
         };
 
         let mut auto_args = Vec::new();
         for chunk in self.arg.chunks(2) {
-            let [name, expr] = chunk else { continue };
+            let [name, expr] = chunk else {
+                eprintln!("--arg requires paired NAME EXPR values: use --arg NAME --arg EXPR");
+                process::exit(2);
+            };
             auto_args.push((name.clone(), AutoArg::Expr(expr.clone())));
         }
         for chunk in self.argstr.chunks(2) {
-            let [name, value] = chunk else { continue };
+            let [name, value] = chunk else {
+                eprintln!(
+                    "--argstr requires paired NAME VALUE values: use --argstr NAME --argstr VALUE"
+                );
+                process::exit(2);
+            };
             auto_args.push((name.clone(), AutoArg::Str(value.clone())));
         }
 
