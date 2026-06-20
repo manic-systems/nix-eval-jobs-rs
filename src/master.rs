@@ -83,6 +83,7 @@ where
                 if cancel.load(Ordering::Relaxed) {
                     writeln!(child_stdin, "exit")?;
                     child_stdin.flush()?;
+                    let _ = proc.wait();
                     info!("cancellation requested, collector exiting");
                     return Ok(());
                 }
@@ -102,6 +103,7 @@ where
                 if s.active == 0 {
                     writeln!(child_stdin, "exit")?;
                     child_stdin.flush()?;
+                    let _ = proc.wait();
                     info!("evaluation queue empty, exiting worker");
                     return Ok(());
                 }
