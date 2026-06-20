@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
@@ -41,6 +42,27 @@ pub struct Config {
     pub gc_roots_dir: Option<PathBuf>,
     pub workers: usize,
     pub max_memory_size: usize,
+    /// Attach each derivation's `meta` attribute (description, license,
+    /// homepage, maintainers, ...) to the emitted [`Derivation`]. Off by
+    /// default because forcing `meta` deeply costs extra evaluation.
+    #[serde(default)]
+    pub meta: bool,
+    /// Read each derivation's input derivations from the store and attach them
+    /// as [`Derivation::input_drvs`]. Off by default because it reads the
+    /// `.drv` file for every job.
+    #[serde(default)]
+    pub show_input_drvs: bool,
+    /// Flake input overrides applied while locking, as `(input_path, ref)`
+    /// pairs (e.g. `("nixpkgs", "github:NixOS/nixpkgs/nixos-unstable")`). Only
+    /// meaningful for [`Input::Flake`].
+    #[serde(default)]
+    pub override_inputs: Vec<(String, String)>,
+    /// Nix settings applied to the evaluation context before the eval state is
+    /// built, as `(key, value)` pairs (e.g.
+    /// `("allow-import-from-derivation", "false")`). Equivalent to `nix`'s
+    /// `--option KEY VALUE`.
+    #[serde(default)]
+    pub nix_options: Vec<(String, String)>,
 }
 
 /// A derivation emitted by evaluation.
@@ -52,6 +74,19 @@ pub struct Derivation {
     pub system: String,
     pub drv_path: String,
     pub outputs: BTreeMap<String, Option<String>>,
+    /// The derivation's `meta` attribute as freeform JSON, present only when
+    /// [`Config::meta`] is set and the attribute exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+    /// Input derivations keyed by `.drv` store path, present only when
+    /// [`Config::show_input_drvs`] is set. The value mirrors the `inputDrvs`
+    /// entry from the derivation's JSON (typically `{"outputs": [...]}`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub input_drvs: BTreeMap<String, serde_json::Value>,
+    /// Constituent attribute names for an aggregate job (Hydra
+    /// `constituents`), present only when the derivation declares them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constituents: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gc_root_error: Option<String>,
 }
@@ -114,6 +149,10 @@ impl Event {
 ///     gc_roots_dir: None,
 ///     workers: 4,
 ///     max_memory_size: 4096,
+///     meta: false,
+///     show_input_drvs: false,
+///     override_inputs: vec![],
+///     nix_options: vec![],
 /// };
 ///
 /// evix::evaluate(&config, |event| {
@@ -125,6 +164,25 @@ pub fn evaluate<F>(config: &Config, sink: F) -> anyhow::Result<()>
 where
     F: FnMut(&Event) -> anyhow::Result<()> + Send + 'static,
 {
+    evaluate_cancellable(config, &Arc::new(AtomicBool::new(false)), sink)
+}
+
+/// Like [`evaluate`], but observes a cancellation flag.
+///
+/// When `cancel` is set to `true` the master stops dispatching new work, signals
+/// its workers to exit, and returns `Ok(())` once they have wound down. A worker
+/// already evaluating a single attribute runs to the end of that attribute
+/// before observing the request, so cancellation is cooperative rather than an
+/// immediate hard kill. This lets a caller enforce a wall-clock timeout without
+/// leaking worker processes.
+pub fn evaluate_cancellable<F>(
+    config: &Config,
+    cancel: &Arc<AtomicBool>,
+    sink: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&Event) -> anyhow::Result<()> + Send + 'static,
+{
     debug!("evaluating input, {} workers", config.workers);
 
     if let Some(dir) = &config.gc_roots_dir {
@@ -133,7 +191,7 @@ where
     }
 
     let sink = Arc::new(Mutex::new(sink));
-    master::run(config, sink)
+    master::run(config, cancel, sink)
 }
 
 /// Worker entrypoint.
