@@ -158,10 +158,16 @@ fn make_job(
     }))
 }
 
-/// Read a derivation's `meta` attribute as freeform JSON. Best-effort: returns
-/// `None` when the attribute is absent. Individual nested attributes that fail
-/// to force (functions, throwing values) are skipped rather than discarding the
-/// whole `meta` set.
+/// Convert a derivation's `meta` attribute to freeform JSON.
+///
+/// `meta` is informational and nixpkgs fields can fail to force (functions,
+/// `throw`), so unreadable nested attributes are dropped rather than failing the
+/// job. Such omissions are intentional and not logged.
+///
+/// # Returns
+///
+/// The `meta` attrset as a JSON object, or `None` if the derivation declares no
+/// `meta` attribute.
 fn read_meta(value: &Value<'_>) -> Option<serde_json::Value> {
     if !value.has_attr("meta").unwrap_or(false) {
         return None;
@@ -170,10 +176,12 @@ fn read_meta(value: &Value<'_>) -> Option<serde_json::Value> {
     value_to_json(meta)
 }
 
-/// Recursively convert a forced Nix value into JSON. Each node is forced to
-/// weak-head normal form on entry; nodes that fail to force, and value kinds
-/// without a JSON analogue (functions, external values), yield `None` so the
-/// caller can skip them.
+/// Recursively convert a Nix value to JSON, forcing each node on entry.
+///
+/// # Returns
+///
+/// The value as JSON, or `None` if the node fails to force or has no JSON
+/// analogue (thunks that error, functions, external values).
 fn value_to_json(mut value: Value<'_>) -> Option<serde_json::Value> {
     use serde_json::Value as J;
 
@@ -217,9 +225,12 @@ fn value_to_json(mut value: Value<'_>) -> Option<serde_json::Value> {
     }
 }
 
-/// Read the `constituents` attribute of an aggregate (Hydra) job as a list of
-/// attribute-path strings. Returns `None` for ordinary derivations that do not
-/// declare the attribute.
+/// Read the `constituents` attribute of an aggregate (Hydra) job.
+///
+/// # Returns
+///
+/// The constituent attribute-path strings, or `None` when the derivation does
+/// not declare `constituents` (an ordinary, non-aggregate job).
 fn read_constituents(value: &Value<'_>) -> Option<Vec<String>> {
     if !value.has_attr("constituents").unwrap_or(false) {
         return None;
@@ -238,19 +249,39 @@ fn read_constituents(value: &Value<'_>) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Read a derivation's input derivations by parsing the `.drv` file's JSON
-/// representation. Keyed by input `.drv` store path. Best-effort: returns an
-/// empty map when the derivation cannot be read or serialized.
+/// Read a derivation's input derivations from its `.drv` file.
+///
+/// Unlike `meta`, missing `inputDrvs` has downstream consequences (consumers use
+/// it to discover build dependencies), so each failure is logged at `warn`
+/// rather than swallowed silently.
+///
+/// # Returns
+///
+/// A map from absolute input `.drv` store path to that input's output-name list.
+/// Empty when the derivation has no input derivations, or when it cannot be
+/// read, serialized, or parsed (each of those failures is logged).
 fn read_input_drvs(store: &Store, drv_path: &StorePath) -> BTreeMap<String, serde_json::Value> {
     let mut map = BTreeMap::new();
-    let Ok(drv) = store.read_derivation(drv_path) else {
-        return map;
+    let drv = match store.read_derivation(drv_path) {
+        Ok(drv) => drv,
+        Err(e) => {
+            warn!(error = %e, "failed to read derivation for inputDrvs");
+            return map;
+        }
     };
-    let Ok(json) = drv.to_json() else {
-        return map;
+    let json = match drv.to_json() {
+        Ok(json) => json,
+        Err(e) => {
+            warn!(error = %e, "failed to serialize derivation for inputDrvs");
+            return map;
+        }
     };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) else {
-        return map;
+    let parsed = match serde_json::from_str::<serde_json::Value>(&json) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            warn!(error = %e, "failed to parse derivation JSON for inputDrvs");
+            return map;
+        }
     };
     // `nix_derivation_to_json` nests input derivations under `inputs.drvs` and
     // keys them by store-relative basename. Re-add the store prefix so keys are
@@ -259,6 +290,8 @@ fn read_input_drvs(store: &Store, drv_path: &StorePath) -> BTreeMap<String, serd
     let store_dir = store
         .store_dir()
         .unwrap_or_else(|_| "/nix/store".to_string());
+    // A derivation with no input derivations (e.g. a fixed-output fetch) legitimately
+    // has no `inputs.drvs`, so an absent key is normal and not logged.
     let Some(drvs) = parsed
         .get("inputs")
         .and_then(|inputs| inputs.get("drvs"))
@@ -302,9 +335,16 @@ fn output_paths(value: &Value<'_>) -> BTreeMap<String, Option<String>> {
     map
 }
 
-/// Resolve the store path of a single output. Each output is exposed on the
-/// derivation as an attribute whose `outPath` is the store path; fall back to
-/// coercing the attribute directly for non-standard derivations.
+/// Resolve the store path of a single named output.
+///
+/// Each output is exposed on the derivation as an attribute whose `outPath` is
+/// the store path; for non-standard derivations the attribute is coerced
+/// directly as a string or path.
+///
+/// # Returns
+///
+/// The output's store path, or `None` if the output attribute is missing or
+/// cannot be coerced to a path.
 fn output_path_for(value: &Value<'_>, name: &str) -> Option<String> {
     let out = value.get_attr(name).ok()?;
     if let Ok(path) = out.get_attr("outPath").and_then(|v| v.as_string()) {
