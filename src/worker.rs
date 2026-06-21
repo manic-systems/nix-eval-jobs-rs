@@ -1,5 +1,7 @@
 use std::{
+    fs,
     io::{BufRead, Write},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -14,12 +16,7 @@ pub fn run() -> Result<()> {
     let config = read_config()?;
     debug!("worker initialized");
 
-    // Apply Nix settings through NIX_CONFIG before the context loads its
-    // configuration. `nix_setting_set` throws C++ exceptions that unwind across
-    // the FFI boundary and abort the process, so we go through the environment,
-    // which Nix reads when the context initializes.
-    apply_nix_options(&config.nix_options);
-
+    let _nix_options_file = apply_nix_options(&config.nix_options)?;
     let ctx = Arc::new(Context::new().context("Nix context")?);
     let store = Arc::new(Store::open(&ctx, None).context("Nix store")?);
     let state = build_eval_state(&ctx, &store, &config)?;
@@ -76,26 +73,37 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Merge `(key, value)` Nix settings into the `NIX_CONFIG` environment variable
-/// so they are picked up when the Nix context initializes. Existing
-/// `NIX_CONFIG` content is preserved and appended to.
-fn apply_nix_options(options: &[(String, String)]) {
+/// Apply caller-provided Nix settings through Nix's eval-state config loader.
+///
+/// These are evix's `--option KEY VALUE` pairs. They must be set before the
+/// worker opens the store or builds an eval state so options such as
+/// `restrict-eval` and `allowed-uris` affect the evaluation that follows.
+fn apply_nix_options(options: &[(String, String)]) -> Result<Option<PathBuf>> {
     if options.is_empty() {
-        return;
+        return Ok(None);
     }
-    let mut config = std::env::var("NIX_CONFIG").unwrap_or_default();
+
+    let path = std::env::temp_dir().join(format!(
+        "evix-nix-options-{}-{}.conf",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    let mut contents = String::new();
     for (key, value) in options {
-        if !config.is_empty() && !config.ends_with('\n') {
-            config.push('\n');
-        }
-        config.push_str(key);
-        config.push_str(" = ");
-        config.push_str(value);
+        contents.push_str(key);
+        contents.push_str(" = ");
+        contents.push_str(value);
+        contents.push('\n');
     }
+
+    fs::write(&path, contents).context("writing Nix options file")?;
     // SAFETY: called once at worker startup, before any threads are spawned.
     unsafe {
-        std::env::set_var("NIX_CONFIG", config);
+        std::env::set_var("NIX_USER_CONF_FILES", &path);
     }
+    Ok(Some(path))
 }
 
 fn read_config() -> Result<Config> {
