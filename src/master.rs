@@ -1,8 +1,8 @@
 use std::{
   env,
   io,
-  io::{BufRead, BufReader, Write},
-  process::{Child, Command, Stdio},
+  io::{BufRead, BufReader, Read, Write},
+  process::{Child, ChildStdin, ChildStdout, Command, Stdio},
   sync::{
     Arc,
     Condvar,
@@ -21,6 +21,33 @@ use crate::{Config, EvalError, Event, WORKER_ENV};
 /// How often a collector parked waiting for work re-checks the cancellation
 /// flag.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const STDERR_CAPTURE_LIMIT: usize = 16 * 1024;
+
+struct WorkerProcess {
+  proc:   Child,
+  stdin:  ChildStdin,
+  stdout: BufReader<ChildStdout>,
+  stderr: WorkerStderr,
+}
+
+#[derive(Clone)]
+struct WorkerStderr {
+  bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl WorkerStderr {
+  fn capture(stderr: impl Read + Send + 'static) -> Self {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&bytes);
+    thread::spawn(move || capture_stderr(stderr, sink));
+    Self { bytes }
+  }
+
+  fn snapshot(&self) -> String {
+    let bytes = self.bytes.lock().unwrap();
+    String::from_utf8_lossy(&bytes).trim().to_string()
+  }
+}
 
 struct SharedState {
   todo:   Vec<Vec<String>>,
@@ -95,23 +122,23 @@ where
 {
   let (lock, cvar) = &*shared;
 
-  let (mut proc, mut child_stdin, mut reader) = spawn_worker_pair(config)?;
+  let mut worker = spawn_worker_pair(config)?;
 
   loop {
     let path = {
       let mut s = lock.lock().unwrap();
       loop {
         if cancel.load(Ordering::Relaxed) {
-          writeln!(child_stdin, "exit")?;
-          child_stdin.flush()?;
-          let _ = proc.wait();
+          writeln!(worker.stdin, "exit")?;
+          worker.stdin.flush()?;
+          let _ = worker.proc.wait();
           info!("cancellation requested, collector exiting");
           return Ok(());
         }
         if let Some(ref e) = s.error {
           let msg = e.clone();
-          writeln!(child_stdin, "exit")?;
-          child_stdin.flush()?;
+          writeln!(worker.stdin, "exit")?;
+          worker.stdin.flush()?;
           error!(error = %msg, "stopping collector due to fatal error");
           bail!("{msg}");
         }
@@ -122,9 +149,9 @@ where
           break Some(p);
         }
         if s.active == 0 {
-          writeln!(child_stdin, "exit")?;
-          child_stdin.flush()?;
-          let _ = proc.wait();
+          writeln!(worker.stdin, "exit")?;
+          worker.stdin.flush()?;
+          let _ = worker.proc.wait();
           info!("evaluation queue empty, exiting worker");
           return Ok(());
         }
@@ -142,15 +169,10 @@ where
 
     let attr = path.join(".");
     trace!(attr = %attr, "sending work to worker");
-    writeln!(child_stdin, "do {}", serde_json::to_string(&path)?)?;
-    child_stdin.flush()?;
+    writeln!(worker.stdin, "do {}", serde_json::to_string(&path)?)?;
+    worker.stdin.flush()?;
 
-    let event = read_event(&mut reader, &path).with_context(|| {
-      format!(
-        "reading event for {attr}; worker status: {}",
-        worker_status(&mut proc)
-      )
-    })?;
+    let event = read_event(&mut worker, &path)?;
 
     {
       let mut s = lock.lock().unwrap();
@@ -177,21 +199,16 @@ where
       cvar.notify_all();
     }
 
-    let status = read_line(&mut reader).with_context(|| {
-      format!(
-        "reading worker status for {attr}; worker status: {}",
-        worker_status(&mut proc)
-      )
-    })?;
+    let status = read_worker_line(&mut worker, "status", &attr)?;
     trace!(attr = %attr, status = %status, "received worker status");
     match status.as_str() {
       "ready" => {},
       "restart" => {
         info!("restarting worker due to memory limit");
-        if let Ok(status) = proc.wait() {
+        if let Ok(status) = worker.proc.wait() {
           debug!(?status, "previous worker exited");
         }
-        (proc, child_stdin, reader) = spawn_worker_pair(config)?;
+        worker = spawn_worker_pair(config)?;
       },
       other => {
         if let Ok(Event::Error(EvalError { error, .. })) =
@@ -209,30 +226,67 @@ where
   }
 }
 
-fn read_event(
-  reader: &mut BufReader<impl io::Read>,
-  path: &[String],
-) -> Result<Event> {
-  let resp = read_line(reader)?;
+fn read_event(worker: &mut WorkerProcess, path: &[String]) -> Result<Event> {
+  let attr = path.join(".");
+  let resp = read_worker_line(worker, "event", &attr)?;
   serde_json::from_str(&resp)
     .with_context(|| format!("parsing worker response for {path:?}: {resp}"))
 }
 
-fn read_line(reader: &mut BufReader<impl io::Read>) -> Result<String> {
+fn read_line(reader: &mut BufReader<impl io::Read>) -> Result<Option<String>> {
   let mut line = String::new();
   if reader.read_line(&mut line)? == 0 {
-    bail!("worker closed stdout unexpectedly");
+    return Ok(None);
   }
-  Ok(line.trim_matches(['\n', '\r', ' ']).to_string())
+  Ok(Some(line.trim_matches(['\n', '\r', ' ']).to_string()))
+}
+
+fn read_worker_line(
+  worker: &mut WorkerProcess,
+  phase: &str,
+  attr: &str,
+) -> Result<String> {
+  read_line(&mut worker.stdout)?
+    .ok_or_else(|| worker_closed_stdout_error(worker, phase, attr))
+}
+
+fn worker_closed_stdout_error(
+  worker: &mut WorkerProcess,
+  phase: &str,
+  attr: &str,
+) -> anyhow::Error {
+  let status = worker_status(&mut worker.proc);
+  let stderr = worker.stderr.snapshot();
+  anyhow::anyhow!(
+    "{}",
+    format_worker_closed_stdout_error(phase, attr, &status, &stderr)
+  )
+}
+
+fn format_worker_closed_stdout_error(
+  phase: &str,
+  attr: &str,
+  status: &str,
+  stderr: &str,
+) -> String {
+  let mut message = format!(
+    "evix worker closed stdout while reading {phase} for {attr}; worker \
+     status: {status}"
+  );
+  if stderr.is_empty() {
+    message.push_str("; worker stderr was empty");
+  } else {
+    message.push_str("; worker stderr:\n");
+    message.push_str(stderr);
+  }
+  message
 }
 
 /// Spawn a worker subprocess, handshake, and return the child handle together
 /// with its stdin writer and stdout reader.
 ///
 /// The worker is the same binary re-executed with [`WORKER_ENV`] set.
-fn spawn_worker_pair(
-  config: &Config,
-) -> Result<(Child, impl Write, BufReader<impl io::Read>)> {
+fn spawn_worker_pair(config: &Config) -> Result<WorkerProcess> {
   let exe = env::current_exe().context("resolving current exe")?;
   debug!("spawning worker process");
 
@@ -240,7 +294,7 @@ fn spawn_worker_pair(
     .env(WORKER_ENV, "1")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
-    .stderr(Stdio::inherit())
+    .stderr(Stdio::piped())
     .spawn()
     .with_context(|| format!("spawning worker process from {exe:?}"))?;
 
@@ -248,16 +302,23 @@ fn spawn_worker_pair(
   writeln!(stdin, "{}", serde_json::to_string(config)?)?;
   stdin.flush()?;
 
-  let mut reader =
-    BufReader::new(child.stdout.take().context("worker stdout")?);
-  read_ready(&mut reader)?;
+  let stdout = BufReader::new(child.stdout.take().context("worker stdout")?);
+  let stderr =
+    WorkerStderr::capture(child.stderr.take().context("worker stderr")?);
+  let mut worker = WorkerProcess {
+    proc: child,
+    stdin,
+    stdout,
+    stderr,
+  };
+  read_ready(&mut worker)?;
   info!("worker ready");
 
-  Ok((child, stdin, reader))
+  Ok(worker)
 }
 
-fn read_ready(reader: &mut BufReader<impl io::Read>) -> Result<()> {
-  let line = read_line(reader)?;
+fn read_ready(worker: &mut WorkerProcess) -> Result<()> {
+  let line = read_worker_line(worker, "handshake", "<startup>")?;
   if line != "ready" {
     bail!("unexpected worker handshake: {line:?}");
   }
@@ -270,4 +331,57 @@ fn worker_status(proc: &mut Child) -> String {
     .ok()
     .flatten()
     .map_or_else(|| "unknown".to_string(), |s| s.to_string())
+}
+
+fn capture_stderr(mut stderr: impl Read, sink: Arc<Mutex<Vec<u8>>>) {
+  let mut buffer = [0; 1024];
+  loop {
+    match stderr.read(&mut buffer) {
+      Ok(0) => break,
+      Ok(n) => {
+        let mut bytes = sink.lock().unwrap();
+        bytes.extend_from_slice(&buffer[..n]);
+        if bytes.len() > STDERR_CAPTURE_LIMIT {
+          let drain = bytes.len() - STDERR_CAPTURE_LIMIT;
+          bytes.drain(..drain);
+        }
+      },
+      Err(_) => break,
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::format_worker_closed_stdout_error;
+
+  #[test]
+  fn closed_stdout_error_includes_phase_attr_status_and_stderr() {
+    let message = format_worker_closed_stdout_error(
+      "event",
+      "packages.x86_64-linux.bad",
+      "exit status: 1",
+      "evix worker failed: locking flake\ncaused by: missing input",
+    );
+
+    assert!(message.contains("reading event"));
+    assert!(message.contains("packages.x86_64-linux.bad"));
+    assert!(message.contains("exit status: 1"));
+    assert!(message.contains("locking flake"));
+    assert!(!message.contains("worker closed stdout unexpectedly"));
+  }
+
+  #[test]
+  fn closed_stdout_error_notes_empty_stderr() {
+    let message = format_worker_closed_stdout_error(
+      "handshake",
+      "<startup>",
+      "exit status: 101",
+      "",
+    );
+
+    assert!(message.contains("reading handshake"));
+    assert!(message.contains("<startup>"));
+    assert!(message.contains("worker stderr was empty"));
+  }
 }
