@@ -12,7 +12,7 @@ let
 in
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "evix";
-  version = "0.1.0";
+  version = "0.3.3";
 
   src = let
     fs = lib.fileset;
@@ -21,13 +21,20 @@ rustPlatform.buildRustPackage (finalAttrs: {
     fs.toSource {
       root = s;
       fileset = fs.unions [
-        (s + /src)
+        (s + /crates)
         (s + /Cargo.lock)
         (s + /Cargo.toml)
       ];
     };
 
   cargoLock.lockFile = "${finalAttrs.src}/Cargo.lock";
+  cargoBuildFlags = [
+    "-p"
+    "evix-cli"
+    "-p"
+    "evix-daemon"
+  ];
+  cargoTestFlags = finalAttrs.cargoBuildFlags;
   enableParallelBuilding = true;
 
   nativeBuildInputs = [

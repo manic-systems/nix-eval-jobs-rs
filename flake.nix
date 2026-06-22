@@ -13,6 +13,9 @@
       default = pkgsForEach.${system}.callPackage ./nix/package.nix {};
     });
 
+    nixosModules.default = import ./nix/module.nix;
+    nixosModules.evix = self.nixosModules.default;
+
     devShells = forEachSystem (system: {
       default = pkgsForEach.${system}.callPackage ./nix/shell.nix {};
     });
