@@ -1,4 +1,5 @@
 use std::{
+  fs,
   path::{Path, PathBuf},
   sync::{
     Arc,
@@ -164,7 +165,7 @@ fn local_flake_root(reference: &str) -> Option<PathBuf> {
 
 fn local_path_inputs(root: &Path) -> Result<Vec<PathBuf>> {
   let lock_path = root.join("flake.lock");
-  let Ok(contents) = std::fs::read_to_string(&lock_path) else {
+  let Ok(contents) = fs::read_to_string(&lock_path) else {
     return Ok(Vec::new());
   };
   let lock: serde_json::Value =

@@ -1,82 +1,93 @@
 use std::{
+  env,
   fs,
-  io::{BufRead, Write},
+  mem,
   path::PathBuf,
+  process,
   sync::Arc,
+  time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result, bail};
 use nix_bindings::{Context, EvalState, EvalStateBuilder, Store, Value};
+use tokio::io::{BufReader, BufWriter};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{debug, trace, warn};
 
-use crate::{AutoArg, Config, Input};
+use crate::{
+  AutoArg,
+  Input,
+  remote_proto::{ClientMessage, ServerMessage, read_client, write_server},
+  worker_config::WorkerConfig,
+  worker_process::WorkerStatus,
+};
 
 /// Worker entrypoint.
 ///
-/// Reads the [`Config`] as a JSON line from stdin, initializes the Nix
-/// evaluation state, then loops: receive an attribute path from the master,
-/// evaluate it, and write the resulting [`Event`] back to stdout. Exits when
-/// the master sends `"exit"` or closes stdin, or when the memory limit is
-/// exceeded (signalled with `"restart"` so the master replaces the process).
+/// Reads the worker setup from stdin, initializes the Nix evaluation state,
+/// then loops: receive an attribute path from the master, evaluate it, and
+/// write the resulting [`Event`] back to stdout. Exits when the master sends
+/// shutdown or when the memory limit is exceeded.
 #[allow(clippy::arc_with_non_send_sync)]
-pub fn run() -> Result<()> {
-  let config = read_config()?;
+pub async fn run() -> Result<()> {
+  let stdin = tokio::io::stdin();
+  let stdout = tokio::io::stdout();
+  let mut reader = BufReader::new(stdin).compat();
+  let mut writer = BufWriter::new(stdout).compat_write();
+
+  let config = match read_client(&mut reader).await? {
+    ClientMessage::Setup(config) => config,
+    other => bail!("worker expected setup message, got {other:?}"),
+  };
   debug!("worker initialized");
 
   let _nix_options_file = apply_nix_options(&config.nix_options)?;
   let ctx = Arc::new(Context::new().context("Nix context")?);
   let store = Arc::new(Store::open(&ctx, None).context("Nix store")?);
+  let eval_config = config.to_config();
   let state = build_eval_state(&ctx, &store, &config)?;
   let auto_args = build_auto_args(&state, &config.auto_args)?;
   let auto_ref = auto_args.as_ref();
 
   let root = eval_root(&ctx, &state, &config, auto_ref)?;
 
-  let stdin = std::io::stdin();
-  let mut stdout = std::io::stdout();
-
-  writeln!(stdout, "ready")?;
-  stdout.flush()?;
+  write_server(&mut writer, &ServerMessage::Ready).await?;
 
   loop {
-    let mut line = String::new();
-    if stdin.lock().read_line(&mut line)? == 0 {
-      debug!("master closed stdin, worker exiting");
-      break;
-    }
-    let cmd = line.trim_matches(['\n', '\r', ' ']);
-
-    if cmd == "exit" {
-      debug!("received exit command, worker shutting down");
-      break;
-    }
-    if !cmd.starts_with("do ") {
-      bail!("invalid worker command: {cmd}");
-    }
-
-    let path: Vec<String> = serde_json::from_str(cmd[3..].trim())
-      .context("parsing attr path from master")?;
+    let path = match read_client(&mut reader).await? {
+      ClientMessage::Work(path) => path,
+      ClientMessage::Shutdown => {
+        debug!("received shutdown command, worker exiting");
+        break;
+      },
+      ClientMessage::Setup(_) => bail!("worker setup sent twice"),
+    };
     let attr = path.join(".");
     trace!(attr = %attr, "evaluating attribute");
 
     let response = crate::eval::process_attr(
-      &state, &store, &root, &path, auto_ref, &config,
+      &state,
+      &store,
+      &root,
+      &path,
+      auto_ref,
+      &eval_config,
     );
-    writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-    stdout.flush()?;
+    write_server(&mut writer, &ServerMessage::Event(Box::new(response)))
+      .await?;
 
     if should_restart(config.max_memory_size) {
       warn!(
         max_rss_kb = get_maxrss_kb(),
         "memory limit exceeded, worker restarting"
       );
-      writeln!(stdout, "restart")?;
-      stdout.flush()?;
+      write_server(&mut writer, &ServerMessage::Status(WorkerStatus::Restart))
+        .await?;
       return Ok(());
     }
 
-    writeln!(stdout, "ready")?;
-    stdout.flush()?;
+    write_server(&mut writer, &ServerMessage::Status(WorkerStatus::Ready))
+      .await?;
   }
 
   Ok(())
@@ -92,11 +103,11 @@ fn apply_nix_options(options: &[(String, String)]) -> Result<Option<PathBuf>> {
     return Ok(None);
   }
 
-  let path = std::env::temp_dir().join(format!(
+  let path = env::temp_dir().join(format!(
     "evix-nix-options-{}-{}.conf",
-    std::process::id(),
-    std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
+    process::id(),
+    SystemTime::now()
+      .duration_since(UNIX_EPOCH)
       .map_or(0, |duration| duration.as_nanos())
   ));
   let mut contents = String::new();
@@ -110,17 +121,9 @@ fn apply_nix_options(options: &[(String, String)]) -> Result<Option<PathBuf>> {
   fs::write(&path, contents).context("writing Nix options file")?;
   // SAFETY: called once at worker startup, before any threads are spawned.
   unsafe {
-    std::env::set_var("NIX_USER_CONF_FILES", &path);
+    env::set_var("NIX_USER_CONF_FILES", &path);
   }
   Ok(Some(path))
-}
-
-fn read_config() -> Result<Config> {
-  let mut line = String::new();
-  if std::io::stdin().lock().read_line(&mut line)? == 0 {
-    bail!("worker received no configuration line");
-  }
-  serde_json::from_str(line.trim()).context("parsing worker configuration")
 }
 
 /// Build a new [`EvalState`] from the given store, attaching flake settings
@@ -129,7 +132,7 @@ fn read_config() -> Result<Config> {
 fn build_eval_state(
   _ctx: &Arc<Context>,
   store: &Arc<Store>,
-  config: &Config,
+  config: &WorkerConfig,
 ) -> Result<EvalState> {
   let mut builder =
     EvalStateBuilder::new(store).context("eval state builder")?;
@@ -151,7 +154,7 @@ fn build_eval_state(
 fn eval_root<'s>(
   ctx: &Arc<Context>,
   state: &'s EvalState,
-  config: &Config,
+  config: &WorkerConfig,
   auto_args: Option<&Value<'s>>,
 ) -> Result<Value<'s>> {
   match &config.input {
@@ -186,6 +189,7 @@ fn eval_flake<'s>(
     FlakeReference,
     FlakeReferenceParseFlags,
     LockFlags,
+    LockMode,
     LockedFlake,
   };
 
@@ -193,8 +197,14 @@ fn eval_flake<'s>(
     nix_bindings::flake::FlakeSettings::new(ctx).context("flake settings")?,
   );
   let fetchers = FetchersSettings::new(ctx).context("fetcher settings")?;
+  let base_dir =
+    env::current_dir().context("resolving flake base directory")?;
   let parse_flags = FlakeReferenceParseFlags::new(ctx, &flake_settings)
-    .context("parse flags")?;
+    .context("parse flags")?
+    .set_base_directory(&base_dir.to_string_lossy())
+    .with_context(|| {
+      format!("setting flake base directory {}", base_dir.display())
+    })?;
 
   let (flake_ref, fragment) = FlakeReference::parse(
     ctx,
@@ -205,8 +215,10 @@ fn eval_flake<'s>(
   )
   .context("parsing flake reference")?;
 
-  let mut lock_flags =
-    LockFlags::new(ctx, &flake_settings).context("lock flags")?;
+  let mut lock_flags = LockFlags::new(ctx, &flake_settings)
+    .context("lock flags")?
+    .set_mode(LockMode::Virtual)
+    .context("setting lock mode")?;
   for (name, value) in override_inputs {
     let (override_ref, _fragment) = FlakeReference::parse(
       ctx,
@@ -299,7 +311,7 @@ fn should_restart(max_memory_mb: usize) -> bool {
 }
 
 fn get_maxrss_kb() -> usize {
-  let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+  let mut usage: libc::rusage = unsafe { mem::zeroed() };
   unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
   let rss = usage.ru_maxrss as usize;
   if cfg!(target_os = "macos") {

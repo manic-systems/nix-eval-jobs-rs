@@ -5,13 +5,21 @@ use serde::{Deserialize, Serialize};
 mod async_master;
 mod eval;
 pub mod json;
-mod remote;
+mod remote_proto;
+mod remote_worker;
 mod run;
 mod serde_config;
 mod session;
 mod state;
 mod watch;
 mod worker;
+mod worker_config;
+mod worker_process;
+
+#[allow(clippy::all, warnings)]
+mod worker_capnp {
+  include!(concat!(env!("OUT_DIR"), "/worker_capnp.rs"));
+}
 
 pub use session::Session;
 
@@ -76,7 +84,7 @@ pub struct Config {
   /// Enable file watching for long-lived sessions.
   #[serde(default)]
   pub watch:           bool,
-  /// SSH remotes available to the master.
+  /// Remote worker endpoints available to the master.
   #[serde(default)]
   pub remotes:         Vec<Remote>,
 }
@@ -100,12 +108,13 @@ impl Default for Config {
   }
 }
 
-/// SSH remote worker pool configuration.
+/// Remote worker pool configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Remote {
-  pub host:    String,
-  pub systems: Vec<String>,
-  pub workers: usize,
+  #[serde(alias = "host")]
+  pub endpoint: String,
+  pub systems:  Vec<String>,
+  pub workers:  usize,
 }
 
 /// A derivation emitted by evaluation.
@@ -194,8 +203,16 @@ impl Event {
 
 /// Worker entrypoint.
 ///
-/// Reads the [`Config`] as a JSON line from stdin, then processes attribute
-/// paths requested by the master process.
+/// Reads a typed setup message from stdin, then processes attribute paths
+/// requested by the master process.
 pub fn run_worker() -> anyhow::Result<()> {
-  worker::run()
+  tokio::runtime::Builder::new_current_thread()
+    .enable_io()
+    .build()?
+    .block_on(worker::run())
+}
+
+/// Serve remote evaluation workers over Cap'n Proto stream framing.
+pub async fn serve_remote_worker(addr: &str) -> anyhow::Result<()> {
+  remote_worker::serve(addr).await
 }
