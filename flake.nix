@@ -7,17 +7,34 @@
   }: let
     systems = ["x86_64-linux" "aarch64-linux"];
     forEachSystem = nixpkgs.lib.genAttrs systems;
-    pkgsForEach = nixpkgs.legacyPackages;
+    pkgsForEach = system:
+      import nixpkgs {
+        localSystem.system = system;
+        overlays = [self.overlays.evix];
+      };
   in {
-    packages = forEachSystem (system: {
-      default = pkgsForEach.${system}.callPackage ./nix/package.nix {};
+    overlays = {
+      evix = final: _: {
+        evix = final.callPackage ./nix/package.nix {};
+      };
+    };
+
+    packages = forEachSystem (system: let
+      pkgs = pkgsForEach system;
+    in {
+      evix = pkgs.callPackage ./nix/package.nix {};
+      default = self.packages.${system}.evix;
     });
 
-    nixosModules.default = import ./nix/module.nix;
-    nixosModules.evix = self.nixosModules.default;
+    nixosModules = {
+      default = ./nix/module.nix;
+      evix = self.nixosModules.default;
+    };
 
-    devShells = forEachSystem (system: {
-      default = pkgsForEach.${system}.callPackage ./nix/shell.nix {};
+    devShells = forEachSystem (system: let
+      pkgs = pkgsForEach system;
+    in {
+      default = pkgs.callPackage ./nix/shell.nix {};
     });
 
     hydraJobs = self.packages;
