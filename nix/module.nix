@@ -1,45 +1,49 @@
 {
   config,
-  lib,
   pkgs,
+  lib,
   ...
 }: let
+  inherit (lib.modules) mkIf;
+  inherit (lib.options) mkOption mkEnableOption mkPackageOption;
+  inherit (lib.types) nullOr str;
+
   cfg = config.services.evix;
 in {
   options.services.evix = {
-    enable = lib.mkEnableOption "evix Nix evaluator tools";
+    enable = mkEnableOption "evix Nix evaluator service and CLI";
 
-    package = lib.mkOption {
-      type = lib.types.package;
-      default = pkgs.callPackage ./package.nix {};
-      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix {}";
-      description = "evix package to install.";
-    };
+    package = mkPackageOption pkgs "evix" {};
 
     daemon = {
-      enable = lib.mkEnableOption "the evix daemon user service";
+      enable = mkEnableOption "the evix daemon user service";
 
-      socket = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
+      socket = mkOption {
+        type = nullOr str;
         default = null;
         example = "%t/evix.sock";
-        description = "Optional EVIX_SOCKET path for the user daemon.";
+        description = "Optional `EVIX_SOCKET` path for the user daemon.";
       };
     };
   };
 
-  config = lib.mkIf cfg.enable {
-    environment.systemPackages = [cfg.package];
+  config = mkIf cfg.enable {
+    environment.systemPackages = [cfg.package]; # provides evix-cli and evixd
 
-    systemd.user.services.evixd = lib.mkIf cfg.daemon.enable {
+    systemd.user.services.evixd = mkIf cfg.daemon.enable {
       description = "evix daemon";
       wantedBy = ["default.target"];
+      wants = ["nix-daemon.service"];
       serviceConfig = {
         ExecStart = "${lib.getExe' cfg.package "evixd"} --foreground";
         Restart = "on-failure";
-      };
-      environment = lib.optionalAttrs (cfg.daemon.socket != null) {
-        EVIX_SOCKET = cfg.daemon.socket;
+        Environment = lib.optional (cfg.daemon.socket != null) [
+          "EVIX_SOCKET = ${cfg.daemon.socket}"
+        ];
+
+        WorkingDirectory = "";
+        RuntimeDirectory = "evix";
+        RuntimeDirectoryMode = "0755";
       };
     };
   };
