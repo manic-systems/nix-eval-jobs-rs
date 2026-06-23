@@ -5,7 +5,7 @@ inline Nix expressions through the Nix C API. Evix walks the resulting attribute
 graph, and streams derivation information as newline-delimited JSON.
 
 The core crate is built for embedders that need Nix evaluation without shelling
-out to Nix or `nix-eval-jobs`, using hte _stable C API_ directly.
+out to Nix or `nix-eval-jobs`, using the _stable C API_ directly.
 
 The repository also ships:
 
@@ -24,7 +24,7 @@ The repository also ships:
   traversal on the first bad attribute.
 - Keeps a warm derivation graph in `Session` or `evixd`, enabling cheap queries
   and diffs after the initial evaluation.
-- Can delegate matching systems to SSH remotes that have `evix` installed.
+- Can distribute evaluation to remote `evix worker` listeners over Cap'n Proto.
 
 Evix evaluates Nix expressions and reports derivations. It does not build the
 derivations it discovers.
@@ -76,7 +76,7 @@ evix eval --file ./default.nix
 Evaluate once and stream events as NDJSON:
 
 ```bash
-# Evaluate with four workers and while attach each derivation's `meta`
+# Evaluate with four workers and attach each derivation's `meta`
 # attribute.
 $ evix eval --flake .#hydraJobs --workers 4 --meta
 ```
@@ -119,13 +119,37 @@ $ evixd --foreground
 By default, the daemon listens on `/run/user/$UID/evix.sock`. Override that with
 `--socket PATH` or `EVIX_SOCKET`.
 
+### `evix worker`
+
+Start a remote evaluation worker service:
+
+```bash
+$ evix worker --listen 0.0.0.0:7357
+```
+
+Masters connect to worker services with `--remote ENDPOINT SYSTEMS WORKERS`.
+`SYSTEMS` is a comma-separated list of derivation systems that endpoint should
+emit; use an empty list to accept every system. `WORKERS` opens that many
+parallel worker connections to the endpoint:
+
+```bash
+$ evix eval --no-daemon --workers 0 \
+    --remote builder-a:7357 x86_64-linux 4 \
+    --remote builder-b:7357 aarch64-linux 2 \
+    --flake .#hydraJobs
+```
+
+The worker service uses Cap'n Proto stream framing over TCP for setup, work, and
+status messages. Each remote connection hosts an isolated evaluator subprocess
+on the worker node, matching local worker memory and restart behavior.
+
 ### `evix query`
 
 Query a warm daemon session. A matching `eval` or `watch` request must have
 completed first with the same evaluation config:
 
 ```bash
-# Evauate and forward the result
+# Evaluate and forward the result
 $ evix eval --flake .#hydraJobs --workers 4 >/tmp/jobs.ndjson
 
 # Evaluate for a specific system
@@ -152,34 +176,34 @@ Like `query`, `diff` requires an existing warm daemon session.
 
 <!-- markdownlint-disable MD013 -->
 
-| Flag                        | Description                                                    |
-| --------------------------- | -------------------------------------------------------------- |
-| `--flake REF`               | Evaluate a flake output                                        |
-| `--expr EXPR`               | Evaluate an inline Nix expression                              |
-| `--file PATH`               | Evaluate a Nix file                                            |
-| `--arg NAME EXPR`           | Pass a Nix expression argument to auto-called functions        |
-| `--argstr NAME VALUE`       | Pass a string argument to auto-called functions                |
-| `--override-input NAME REF` | Override a flake input while locking                           |
-| `--option KEY VALUE`        | Set a Nix option before evaluation                             |
-| `--remote HOST SYSTEMS N`   | Add an SSH remote for comma-separated systems with `N` workers |
-| `--meta`                    | Include each derivation's `meta` attribute                     |
-| `--show-input-drvs`         | Include input derivations from each `.drv` file                |
-| `--workers N`               | Local worker process count, default `1`                        |
-| `--max-memory MB`           | Memory limit per local worker, default `4096`                  |
-| `--force-recurse`           | Recurse into all attrsets, ignoring `recurseForDerivations`    |
-| `--gc-roots-dir DIR`        | Register GC root symlinks for evaluated derivations            |
-| `--socket PATH`             | Daemon socket path for daemon-backed commands                  |
-| `-v`, `--verbose`           | Increase logging verbosity, repeat for trace logs              |
+| Flag                        | Description                                                       |
+| --------------------------- | ----------------------------------------------------------------- |
+| `--flake REF`               | Evaluate a flake output                                           |
+| `--expr EXPR`               | Evaluate an inline Nix expression                                 |
+| `--file PATH`               | Evaluate a Nix file                                               |
+| `--arg NAME EXPR`           | Pass a Nix expression argument to auto-called functions           |
+| `--argstr NAME VALUE`       | Pass a string argument to auto-called functions                   |
+| `--override-input NAME REF` | Override a flake input while locking                              |
+| `--option KEY VALUE`        | Set a Nix option before evaluation                                |
+| `--remote ENDPOINT SYSTEMS N` | Add `N` remote worker connections for matching systems          |
+| `--meta`                    | Include each derivation's `meta` attribute                        |
+| `--show-input-drvs`         | Include input derivations from each `.drv` file                   |
+| `--workers N`               | Local worker process count, default `1`                           |
+| `--max-memory MB`           | Memory limit per local worker, default `4096`                     |
+| `--force-recurse`           | Recurse into all attrsets, ignoring `recurseForDerivations`       |
+| `--gc-roots-dir DIR`        | Register GC root symlinks for evaluated derivations               |
+| `--socket PATH`             | Daemon socket path for daemon-backed commands                     |
+| `-v`, `--verbose`           | Increase logging verbosity, repeat for trace logs                 |
 
 <!-- markdownlint-enable MD013 -->
 
 Logs are written to stderr. JSON events are written to stdout. `RUST_LOG`
 overrides `--verbose` when set.
 
-Remote workers are started with `ssh HOST evix eval --no-daemon ...`. The remote
-machine must already have `evix` in `PATH`. Local evaluation skips systems owned
-by a configured remote, and remote output is filtered by the remote's system
-list.
+Local and remote workers consume the same attribute queue. Remote derivation
+output is accepted when it matches the remote's system list. If a remote
+evaluates a derivation for a system it does not own, the master requeues that
+attribute for another eligible worker instead of dropping it.
 
 ## Output Format
 
@@ -312,7 +336,7 @@ will no doubt change but for the time being the requirements are as follows:
 
 - Rust `1.90.0` or newer.
 - Nix development headers compatible with `nix-bindings`.
-- Linux on `x86_64` or `aarch64`. Darwin support may be available in the future
+- Linux on `x86_64` or `aarch64`. Darwin support may be available in the future.
 
 The flake dev shell provides the expected Rust and Nix C API environment:
 
