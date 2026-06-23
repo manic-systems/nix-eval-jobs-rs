@@ -1,6 +1,9 @@
-use std::sync::{
-  Arc,
-  atomic::{AtomicBool, Ordering},
+use std::{
+  future::Future,
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -199,7 +202,7 @@ impl Session {
 
 fn spawn_session_task<T: Send + 'static>(
   tx: futures_mpsc::UnboundedSender<Result<T>>,
-  future: impl std::future::Future<Output = ()> + Send + 'static,
+  future: impl Future<Output = ()> + Send + 'static,
 ) {
   match tokio::runtime::Handle::try_current() {
     Ok(handle) => {

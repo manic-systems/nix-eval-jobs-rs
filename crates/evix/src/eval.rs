@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, os::unix::fs as unix_fs, path::Path};
 
 use anyhow::{Context as _, Result};
 use nix_bindings::{EvalState, Store, StorePath, Value, ValueType};
@@ -399,13 +399,13 @@ fn output_path_for(value: &Value<'_>, name: &str) -> Option<String> {
 
 /// Create a symlink under `gc_dir` pointing to `drv_path` so the Nix garbage
 /// collector retains the derivation and its outputs.
-fn register_gc_root(gc_dir: &std::path::Path, drv_path: &str) -> Result<()> {
-  let name = std::path::Path::new(drv_path)
+fn register_gc_root(gc_dir: &Path, drv_path: &str) -> Result<()> {
+  let name = Path::new(drv_path)
     .file_name()
     .context("drv path has no filename")?;
   let link = gc_dir.join(name);
   if !link.exists() {
-    std::os::unix::fs::symlink(drv_path, &link)
+    unix_fs::symlink(drv_path, &link)
       .with_context(|| format!("symlinking {link:?} -> {drv_path}"))?;
   }
   Ok(())
