@@ -11,6 +11,10 @@
   capnproto,
   nixVersions,
   glibc,
+  cargo-nextest,
+  jq,
+  hyperfine,
+  nix-eval-jobs,
 }: let
   inherit (rustc) llvmPackages;
   nixForBindings = nixVersions.nix_2_34;
@@ -20,15 +24,24 @@ in
 
     strictDeps = true;
     nativeBuildInputs = [
-      capnproto
       pkg-config
       cargo
       rustc
       llvmPackages.lld
+      capnproto # remote protocol
+
       (rustfmt.override {asNightly = true;})
       clippy
       taplo
       rust-analyzer
+
+      # Additional Cargo tooling
+      cargo-nextest
+
+      # Benchmarking
+      jq
+      hyperfine
+      nix-eval-jobs
     ];
 
     buildInputs = [
