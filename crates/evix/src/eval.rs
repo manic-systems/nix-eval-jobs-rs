@@ -1,16 +1,28 @@
-use std::{collections::BTreeMap, os::unix::fs as unix_fs, path::Path};
+use std::{
+  collections::BTreeMap,
+  os::unix::fs as unix_fs,
+  path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, Result};
 use nix_bindings::{EvalState, Store, StorePath, Value, ValueType};
 use tracing::{debug, warn};
 
-use crate::{Config, EvalError, Event};
+use crate::{EvalError, Event};
+
+#[derive(Debug, Clone)]
+pub(crate) struct EvalOptions {
+  pub(crate) force_recurse:   bool,
+  pub(crate) gc_roots_dir:    Option<PathBuf>,
+  pub(crate) meta:            bool,
+  pub(crate) show_input_drvs: bool,
+}
 
 /// Evaluate a single attribute path against the Nix expression root.
 ///
 /// Navigates `root` along `path` (auto-calling functions at each step), then
 /// inspects the resulting value: if it is a derivation, the function reads
-/// name, system, outputs, and, depending on [`Config`], meta, input
+/// name, system, outputs, and, depending on [`EvalOptions`], meta, input
 /// derivations, and constituents. If it is an attrset, child names are
 /// collected for further traversal. If it is neither, an empty attrset is
 /// emitted.
@@ -20,7 +32,7 @@ pub fn process_attr<'s>(
   root: &Value<'s>,
   path: &[String],
   auto_args: Option<&Value<'s>>,
-  config: &Config,
+  options: &EvalOptions,
 ) -> Event {
   let attr = path.join(".");
 
@@ -46,7 +58,7 @@ pub fn process_attr<'s>(
 
   match state.get_derivation(&value) {
     Ok(Some(drv_path)) => {
-      match make_job(store, &value, path, drv_path, config) {
+      match make_job(store, &value, path, drv_path, options) {
         Ok(ev) => ev,
         Err(e) => {
           Event::Error(EvalError {
@@ -59,7 +71,7 @@ pub fn process_attr<'s>(
       }
     },
     Ok(None) => {
-      let children = collect_recurse(&value, path, config.force_recurse);
+      let children = collect_recurse(&value, path, options.force_recurse);
       Event::AttrSet {
         attr,
         attr_path: path.to_vec(),
@@ -131,7 +143,7 @@ fn make_job(
   value: &Value<'_>,
   path: &[String],
   drv_path: nix_bindings::StorePath,
-  config: &Config,
+  options: &EvalOptions,
 ) -> Result<Event> {
   let attr = path.join(".");
   let drv_path_str =
@@ -147,15 +159,15 @@ fn make_job(
     .unwrap_or_default();
   let outputs = output_paths(value);
 
-  let meta = if config.meta { read_meta(value) } else { None };
+  let meta = if options.meta { read_meta(value) } else { None };
   let constituents = read_constituents(value);
-  let input_drvs = if config.show_input_drvs {
+  let input_drvs = if options.show_input_drvs {
     read_input_drvs(store, &drv_path)
   } else {
     BTreeMap::new()
   };
 
-  let gc_root_error = config.gc_roots_dir.as_ref().and_then(|dir| {
+  let gc_root_error = options.gc_roots_dir.as_ref().and_then(|dir| {
     register_gc_root(dir, &drv_path_str).err().map(|e| {
       warn!(drv_path = %drv_path_str, error = %e, "failed to register gc root");
       e.to_string()

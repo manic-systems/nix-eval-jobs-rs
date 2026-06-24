@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AutoArg, Config, Input};
+use crate::{AutoArg, Config, Input, eval::EvalOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,21 +41,13 @@ impl From<&Config> for WorkerConfig {
   }
 }
 
-impl WorkerConfig {
-  pub(crate) fn to_config(&self) -> Config {
-    Config {
-      input:           self.input.clone(),
-      auto_args:       self.auto_args.clone(),
-      force_recurse:   self.force_recurse,
-      gc_roots_dir:    self.gc_roots_dir.clone(),
-      workers:         1,
-      max_memory_size: self.max_memory_size,
-      meta:            self.meta,
-      show_input_drvs: self.show_input_drvs,
-      override_inputs: self.override_inputs.clone(),
-      nix_options:     self.nix_options.clone(),
-      watch:           false,
-      remotes:         Vec::new(),
+impl From<&WorkerConfig> for EvalOptions {
+  fn from(config: &WorkerConfig) -> Self {
+    Self {
+      force_recurse:   config.force_recurse,
+      gc_roots_dir:    config.gc_roots_dir.clone(),
+      meta:            config.meta,
+      show_input_drvs: config.show_input_drvs,
     }
   }
 }
