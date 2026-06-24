@@ -44,7 +44,7 @@ pub async fn run() -> Result<()> {
   let _nix_options_file = apply_nix_options(&config.nix_options)?;
   let ctx = Arc::new(Context::new().context("Nix context")?);
   let store = Arc::new(Store::open(&ctx, None).context("Nix store")?);
-  let eval_config = config.to_config();
+  let eval_options = crate::eval::EvalOptions::from(&config);
   let state = build_eval_state(&ctx, &store, &config)?;
   let auto_args = build_auto_args(&state, &config.auto_args)?;
   let auto_ref = auto_args.as_ref();
@@ -71,7 +71,7 @@ pub async fn run() -> Result<()> {
       &root,
       &path,
       auto_ref,
-      &eval_config,
+      &eval_options,
     );
     write_server(&mut writer, &ServerMessage::Event(Box::new(response)))
       .await?;
