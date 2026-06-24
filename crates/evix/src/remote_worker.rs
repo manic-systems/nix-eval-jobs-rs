@@ -18,6 +18,11 @@ pub async fn serve(addr: &str) -> Result<()> {
 
   loop {
     let (stream, peer) = listener.accept().await?;
+    // The protocol is one small request/response per attribute, so Nagle's
+    // algorithm would add a round-trip of delay to every work item.
+    if let Err(err) = stream.set_nodelay(true) {
+      error!(peer = %peer, error = %err, "failed to set TCP_NODELAY");
+    }
     tokio::spawn(async move {
       if let Err(err) = serve_connection(stream).await {
         error!(peer = %peer, error = %err, "remote worker connection failed");
@@ -39,12 +44,15 @@ impl RemoteWorker {
   ) -> Result<Self> {
     let label = label.into();
     debug!(worker = %label, endpoint = %endpoint, "connecting remote worker");
-    let mut stream = TcpStream::connect(endpoint)
-      .await
-      .with_context(|| {
-        format!("connecting remote worker {label} at {endpoint}")
-      })?
-      .compat();
+    let tcp = TcpStream::connect(endpoint).await.with_context(|| {
+      format!("connecting remote worker {label} at {endpoint}")
+    })?;
+    // One small request/response per attribute; disable Nagle so each work
+    // item is not delayed waiting to coalesce.
+    tcp.set_nodelay(true).with_context(|| {
+      format!("setting TCP_NODELAY on connection to {label}")
+    })?;
+    let mut stream = tcp.compat();
 
     remote_proto::write_client(
       &mut stream,
