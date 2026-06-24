@@ -16,18 +16,27 @@ The repository also ships:
 ## Why?
 
 [nix-bindings]: https://github.com/notashelf/nix-bindings
+[circus]: https://github.com/manic-systems/circus
 
-- Uses [nix-bindings] directly instead of parsing `nix` command output.
-- Evaluates work in isolated worker processes, so worker memory can be reclaimed
-  between runs.
-- Streams individual derivation and error events instead of failing the whole
-  traversal on the first bad attribute.
-- Keeps a warm derivation graph in `Session` or `evixd`, enabling cheap queries
-  and diffs after the initial evaluation.
-- Can distribute evaluation to remote `evix worker` listeners over Cap'n Proto.
+Nix evaluation is typically slow, leaky, and all-or-nothing. The usual fix is to
+shell out to `nix` and scrape its output, which means you inherit its process
+model and lose structure the moment something breaks. Evix takes an alternate
+path:
+
+- **Talks to Nix, not to a terminal.** It calls the stable Nix C API through
+  [nix-bindings], so you get typed events, not parsed text.
+- **One bad attribute doesn't sink the run.** Each derivation and error is its
+  own streamed event; a broken package is reported and traversal continues.
+- **Leaks are someone else's problem.** Evaluation runs in worker subprocesses
+  that are recycled on a memory limit, so a heavy attrset can't bloat the host.
+- **Evaluate once, query forever.** A warm derivation graph lives in `Session`
+  or the `evixd` daemon, turning follow-up queries and diffs into cheap lookups.
+- **Spread the work across machines.** Remote `evix worker` nodes pull from the
+  same queue over TCP, so an `aarch64` box can own its systems while `x86_64`
+  stays home.
 
 Evix evaluates Nix expressions and reports derivations. It does not build the
-derivations it discovers.
+derivations it discovers. That's for you, or alternatively, [Circus] to do.
 
 ## Quick Start
 
@@ -124,6 +133,7 @@ By default, the daemon listens on `/run/user/$UID/evix.sock`. Override that with
 Start a remote evaluation worker service:
 
 ```bash
+# Bind a worker to 0.0.0.0:7357. This can also be, e.g, your VPN
 $ evix worker --listen 0.0.0.0:7357
 ```
 
@@ -134,14 +144,13 @@ parallel worker connections to the endpoint:
 
 ```bash
 $ evix eval --no-daemon --workers 0 \
-    --remote builder-a:7357 x86_64-linux 4 \
-    --remote builder-b:7357 aarch64-linux 2 \
-    --flake .#hydraJobs
+  --remote builder-a:7357 x86_64-linux 4 \
+  --remote builder-b:7357 aarch64-linux 2 \
+  --flake .#hydraJobs
 ```
 
-The worker service uses Cap'n Proto stream framing over TCP for setup, work, and
-status messages. Each remote connection hosts an isolated evaluator subprocess
-on the worker node, matching local worker memory and restart behavior.
+See [Distributed Evaluation](#distributed-evaluation) for how the master routes
+work to remotes and the wire protocol they speak.
 
 ### `evix query`
 
@@ -176,34 +185,68 @@ Like `query`, `diff` requires an existing warm daemon session.
 
 <!-- markdownlint-disable MD013 -->
 
-| Flag                        | Description                                                       |
-| --------------------------- | ----------------------------------------------------------------- |
-| `--flake REF`               | Evaluate a flake output                                           |
-| `--expr EXPR`               | Evaluate an inline Nix expression                                 |
-| `--file PATH`               | Evaluate a Nix file                                               |
-| `--arg NAME EXPR`           | Pass a Nix expression argument to auto-called functions           |
-| `--argstr NAME VALUE`       | Pass a string argument to auto-called functions                   |
-| `--override-input NAME REF` | Override a flake input while locking                              |
-| `--option KEY VALUE`        | Set a Nix option before evaluation                                |
-| `--remote ENDPOINT SYSTEMS N` | Add `N` remote worker connections for matching systems          |
-| `--meta`                    | Include each derivation's `meta` attribute                        |
-| `--show-input-drvs`         | Include input derivations from each `.drv` file                   |
-| `--workers N`               | Local worker process count, default `1`                           |
-| `--max-memory MB`           | Memory limit per local worker, default `4096`                     |
-| `--force-recurse`           | Recurse into all attrsets, ignoring `recurseForDerivations`       |
-| `--gc-roots-dir DIR`        | Register GC root symlinks for evaluated derivations               |
-| `--socket PATH`             | Daemon socket path for daemon-backed commands                     |
-| `-v`, `--verbose`           | Increase logging verbosity, repeat for trace logs                 |
+| Flag                          | Description                                                 |
+| ----------------------------- | ----------------------------------------------------------- |
+| `--flake REF`                 | Evaluate a flake output                                     |
+| `--expr EXPR`                 | Evaluate an inline Nix expression                           |
+| `--file PATH`                 | Evaluate a Nix file                                         |
+| `--arg NAME EXPR`             | Pass a Nix expression argument to auto-called functions     |
+| `--argstr NAME VALUE`         | Pass a string argument to auto-called functions             |
+| `--override-input NAME REF`   | Override a flake input while locking                        |
+| `--option KEY VALUE`          | Set a Nix option before evaluation                          |
+| `--remote ENDPOINT SYSTEMS N` | Add `N` remote worker connections for matching systems      |
+| `--meta`                      | Include each derivation's `meta` attribute                  |
+| `--show-input-drvs`           | Include input derivations from each `.drv` file             |
+| `--workers N`                 | Local worker process count, default `1`                     |
+| `--max-memory MB`             | Memory limit per local worker, default `4096`               |
+| `--force-recurse`             | Recurse into all attrsets, ignoring `recurseForDerivations` |
+| `--gc-roots-dir DIR`          | Register GC root symlinks for evaluated derivations         |
+| `--socket PATH`               | Daemon socket path for daemon-backed commands               |
+| `-v`, `--verbose`             | Increase logging verbosity, repeat for trace logs           |
 
 <!-- markdownlint-enable MD013 -->
 
 Logs are written to stderr. JSON events are written to stdout. `RUST_LOG`
 overrides `--verbose` when set.
 
-Local and remote workers consume the same attribute queue. Remote derivation
-output is accepted when it matches the remote's system list. If a remote
-evaluates a derivation for a system it does not own, the master requeues that
-attribute for another eligible worker instead of dropping it.
+## Distributed Evaluation
+
+One of the things Evix tries to solve is _distributed_ evaluation. To do this,
+Evix evaluates one attribute graph by handing attributes to a pool of workers.
+Local and remote workers are interchangeable: both pull from a single shared
+work queue and feed their results back to the same scheduler.
+
+### Components
+
+- **The queue.** The master seeds the queue with the root attribute path. Each
+  worker pulls the next path it is eligible for, evaluates it, and returns one
+  event. An attrset event expands into one new queued path per child; a
+  derivation or error event is terminal for that path. Evaluation is done when
+  the queue is empty and no worker is busy.
+
+- **Remote workers.** `evix worker --listen` runs a TCP service. For each
+  connection it spawns its own evaluator subprocess, so a remote connection
+  behaves exactly like a local worker (same memory limit, same restart-on-limit
+  behavior) but it lives on another machine. The master opens `N` connections
+  per `--remote ENDPOINT SYSTEMS N`, each becoming an independent worker in the
+  pool. With `--workers 0` and at least one `--remote`, the master runs no local
+  workers and evaluates entirely on remotes.
+
+- **System routing.** Each remote declares the systems it owns (an empty list
+  means "any"). When a remote returns a derivation for a system it does not own,
+  the master does not drop it: the work item records that worker as having
+  rejected it and goes back on the queue for a different eligible worker. The
+  rejecting worker stays alive for compatible work. If every worker has rejected
+  a path, evaluation fails fatally with
+  `no worker accepted derivation at <attr> for system <system>` rather than
+  silently losing the derivation.
+
+**Wire protocol.** Cap'n Proto messages over TCP with `TCP_NODELAY` set, because
+the exchange is one small request/response per attribute and Nagle would add a
+round-trip of latency to every work item. A connection opens with a
+`Setup(config)` -> `Ready` handshake, then repeats `Work(path)` -> `Event` ->
+`Status`, and closes on `Shutdown`. A `Restart` status tells the master the
+remote hit its memory limit and respawned its subprocess.
 
 ## Output Format
 
