@@ -1,0 +1,44 @@
+name: Tag and Release
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Build and Test with Cargo]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  prepare:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    uses: manic-systems/workflows/.github/workflows/rust-release.yml@8e0aa91fd3b74f101424d4e36ac743c8f8403a32
+    with:
+      stage: prepare
+
+  build:
+    needs: prepare
+    if: ${{ needs.prepare.result == 'success' && needs.prepare.outputs.skip != 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, suffix: linux-amd64 }
+          - { os: ubuntu-24.04-arm, suffix: linux-arm64 }
+    uses: manic-systems/workflows/.github/workflows/rust-build.yml@8e0aa91fd3b74f101424d4e36ac743c8f8403a32
+    with:
+      upload: true
+      version: ${{ needs.prepare.outputs.version }}
+      os: ${{ matrix.os }}
+      suffix: ${{ matrix.suffix }}
+
+  finalize:
+    needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.skip != 'true' && needs.build.result == 'success' }}
+    uses: manic-systems/workflows/.github/workflows/rust-release.yml@8e0aa91fd3b74f101424d4e36ac743c8f8403a32
+    with:
+      stage: finalize
+      version: ${{ needs.prepare.outputs.version }}

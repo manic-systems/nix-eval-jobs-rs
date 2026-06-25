@@ -1,0 +1,19 @@
+name: Build and Test with Cargo
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    uses: manic-systems/workflows/.github/workflows/rust-checks.yml@8e0aa91fd3b74f101424d4e36ac743c8f8403a32
+    with:
+      os: ${{ matrix.os }}
