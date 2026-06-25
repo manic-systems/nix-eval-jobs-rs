@@ -1,43 +1,237 @@
 use std::{env, path::PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use evix::{AutoArg, Config, Filter, Input, Remote};
+use pound::{FromArg, Parse, ValueError};
 
-struct EvalArgs {
-  flake:           Option<String>,
-  expr:            Option<String>,
-  file:            Option<PathBuf>,
-  arg:             Vec<String>,
-  argstr:          Vec<String>,
-  override_input:  Vec<String>,
-  option:          Vec<String>,
-  remote:          Vec<String>,
-  meta:            bool,
-  show_input_drvs: bool,
-  workers:         usize,
-  max_memory:      usize,
-  force_recurse:   bool,
-  gc_roots_dir:    Option<PathBuf>,
+const PACK_SEP: char = '\x1f';
+
+#[derive(Parse)]
+#[pound(name = "evix")]
+struct Cli {
+  #[pound(short, long, count, global)]
+  verbose: u8,
+
+  #[pound(short, long, count, global)]
+  quiet: u8,
+
+  #[pound(subcommand)]
+  command: Commands,
 }
 
-impl Default for EvalArgs {
-  fn default() -> Self {
-    Self {
-      flake:           None,
-      expr:            None,
-      file:            None,
-      arg:             Vec::new(),
-      argstr:          Vec::new(),
-      override_input:  Vec::new(),
-      option:          Vec::new(),
-      remote:          Vec::new(),
-      meta:            false,
-      show_input_drvs: false,
-      workers:         1,
-      max_memory:      4096,
-      force_recurse:   false,
-      gc_roots_dir:    None,
+#[derive(Parse)]
+enum Commands {
+  #[pound(required_group = "input")]
+  Eval {
+    #[pound(long, group = "input")]
+    flake:           Option<String>,
+    #[pound(long, group = "input")]
+    expr:            Option<String>,
+    #[pound(long, group = "input")]
+    file:            Option<PathBuf>,
+    #[pound(long)]
+    arg:             Vec<Pair>,
+    #[pound(long)]
+    argstr:          Vec<Pair>,
+    #[pound(long)]
+    override_input:  Vec<Pair>,
+    #[pound(long)]
+    option:          Vec<Pair>,
+    #[pound(long)]
+    remote:          Vec<RemoteArg>,
+    #[pound(long)]
+    meta:            bool,
+    #[pound(long)]
+    show_input_drvs: bool,
+    #[pound(long, default = "1")]
+    workers:         usize,
+    #[pound(long, alias = "max-memory-size", default = "4096")]
+    max_memory:      usize,
+    #[pound(long)]
+    force_recurse:   bool,
+    #[pound(long)]
+    gc_roots_dir:    Option<PathBuf>,
+    #[pound(long)]
+    socket:          Option<PathBuf>,
+    #[pound(long)]
+    no_daemon:       bool,
+  },
+
+  #[pound(required_group = "input")]
+  Watch {
+    #[pound(long, group = "input")]
+    flake:           Option<String>,
+    #[pound(long, group = "input")]
+    expr:            Option<String>,
+    #[pound(long, group = "input")]
+    file:            Option<PathBuf>,
+    #[pound(long)]
+    arg:             Vec<Pair>,
+    #[pound(long)]
+    argstr:          Vec<Pair>,
+    #[pound(long)]
+    override_input:  Vec<Pair>,
+    #[pound(long)]
+    option:          Vec<Pair>,
+    #[pound(long)]
+    remote:          Vec<RemoteArg>,
+    #[pound(long)]
+    meta:            bool,
+    #[pound(long)]
+    show_input_drvs: bool,
+    #[pound(long, default = "1")]
+    workers:         usize,
+    #[pound(long, alias = "max-memory-size", default = "4096")]
+    max_memory:      usize,
+    #[pound(long)]
+    force_recurse:   bool,
+    #[pound(long)]
+    gc_roots_dir:    Option<PathBuf>,
+    #[pound(long)]
+    socket:          Option<PathBuf>,
+    #[pound(long)]
+    no_daemon:       bool,
+  },
+
+  #[pound(required_group = "input")]
+  Query {
+    #[pound(long, group = "input")]
+    flake:           Option<String>,
+    #[pound(long, group = "input")]
+    expr:            Option<String>,
+    #[pound(long, group = "input")]
+    file:            Option<PathBuf>,
+    #[pound(long)]
+    arg:             Vec<Pair>,
+    #[pound(long)]
+    argstr:          Vec<Pair>,
+    #[pound(long)]
+    override_input:  Vec<Pair>,
+    #[pound(long)]
+    option:          Vec<Pair>,
+    #[pound(long)]
+    remote:          Vec<RemoteArg>,
+    #[pound(long)]
+    meta:            bool,
+    #[pound(long)]
+    show_input_drvs: bool,
+    #[pound(long, default = "1")]
+    workers:         usize,
+    #[pound(long, alias = "max-memory-size", default = "4096")]
+    max_memory:      usize,
+    #[pound(long)]
+    force_recurse:   bool,
+    #[pound(long)]
+    gc_roots_dir:    Option<PathBuf>,
+    #[pound(long)]
+    socket:          Option<PathBuf>,
+    #[pound(long)]
+    system:          Vec<String>,
+    #[pound(long)]
+    attr_prefix:     Vec<String>,
+    #[pound(long, hidden)]
+    no_daemon:       bool,
+  },
+
+  #[pound(required_group = "input")]
+  Diff {
+    #[pound(long, group = "input")]
+    flake:           Option<String>,
+    #[pound(long, group = "input")]
+    expr:            Option<String>,
+    #[pound(long, group = "input")]
+    file:            Option<PathBuf>,
+    #[pound(long)]
+    arg:             Vec<Pair>,
+    #[pound(long)]
+    argstr:          Vec<Pair>,
+    #[pound(long)]
+    override_input:  Vec<Pair>,
+    #[pound(long)]
+    option:          Vec<Pair>,
+    #[pound(long)]
+    remote:          Vec<RemoteArg>,
+    #[pound(long)]
+    meta:            bool,
+    #[pound(long)]
+    show_input_drvs: bool,
+    #[pound(long, default = "1")]
+    workers:         usize,
+    #[pound(long, alias = "max-memory-size", default = "4096")]
+    max_memory:      usize,
+    #[pound(long)]
+    force_recurse:   bool,
+    #[pound(long)]
+    gc_roots_dir:    Option<PathBuf>,
+    #[pound(long)]
+    socket:          Option<PathBuf>,
+  },
+
+  Daemon {
+    #[pound(long)]
+    socket:     Option<PathBuf>,
+    #[pound(long)]
+    foreground: bool,
+  },
+
+  Worker {
+    #[pound(long)]
+    listen: String,
+  },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Pair {
+  name:  String,
+  value: String,
+}
+
+impl FromArg for Pair {
+  fn from_arg(s: &str) -> std::result::Result<Self, ValueError> {
+    let Some((name, value)) = s.split_once(PACK_SEP) else {
+      return Err(ValueError::new(s, "expected packed NAME VALUE"));
+    };
+    Ok(Self {
+      name:  name.to_owned(),
+      value: value.to_owned(),
+    })
+  }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteArg {
+  endpoint: String,
+  systems:  Vec<String>,
+  workers:  usize,
+}
+
+impl FromArg for RemoteArg {
+  fn from_arg(s: &str) -> std::result::Result<Self, ValueError> {
+    let mut values = s.splitn(3, PACK_SEP);
+    let Some(endpoint) = values.next() else {
+      return Err(ValueError::new(s, "expected endpoint"));
+    };
+    let Some(systems) = values.next() else {
+      return Err(ValueError::new(s, "expected systems"));
+    };
+    let Some(workers) = values.next() else {
+      return Err(ValueError::new(s, "expected worker count"));
+    };
+    let workers = workers
+      .parse::<usize>()
+      .map_err(|err| ValueError::new(s, err))?;
+    if workers == 0 {
+      return Err(ValueError::new(s, "worker count must be greater than zero"));
     }
+    Ok(Self {
+      endpoint: endpoint.to_owned(),
+      systems: systems
+        .split(',')
+        .filter(|system| !system.is_empty())
+        .map(str::to_owned)
+        .collect(),
+      workers,
+    })
   }
 }
 
@@ -70,237 +264,225 @@ pub enum CommandPlan {
   },
 }
 
-pub fn parse_plan() -> Result<(u8, CommandPlan)> {
+#[derive(Clone, Copy, Default)]
+pub struct Verbosity {
+  pub verbose: u8,
+  pub quiet:   u8,
+}
+
+pub fn parse_plan() -> Result<(Verbosity, CommandPlan)> {
   parse_plan_from(env::args().skip(1))
 }
 
-fn parse_plan_from<I, S>(args: I) -> Result<(u8, CommandPlan)>
+fn parse_plan_from<I, S>(args: I) -> Result<(Verbosity, CommandPlan)>
 where
   I: IntoIterator<Item = S>,
   S: Into<String>,
 {
-  let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-  let Some((command, rest)) = args.split_first() else {
-    bail!("expected command: eval, watch, query, diff, daemon, or worker");
+  let normalized = normalize_args(args)?;
+  let cli = match Cli::try_parse_from(normalized.iter().map(String::as_str)) {
+    Ok(cli) => cli,
+    Err(error) if error.is_exit() => error.exit(),
+    Err(error) => bail!(error),
   };
-
-  match command.as_str() {
-    "eval" => {
-      let (verbose, args, extra) = parse_eval_args(rest)?;
-      ensure_no_query_flags(&extra)?;
-      Ok((verbose, CommandPlan::Eval {
-        config:     eval_config(args)?,
-        socket:     extra.socket,
-        use_daemon: !extra.no_daemon,
-      }))
+  let plan = command_plan(cli.command)?;
+  Ok((
+    Verbosity {
+      verbose: cli.verbose,
+      quiet:   cli.quiet,
     },
-    "watch" => {
-      let (verbose, args, extra) = parse_eval_args(rest)?;
-      ensure_no_query_flags(&extra)?;
-      let config = eval_config(args)?;
+    plan,
+  ))
+}
+
+fn command_plan(command: Commands) -> Result<CommandPlan> {
+  match command {
+    Commands::Eval {
+      flake,
+      expr,
+      file,
+      arg,
+      argstr,
+      override_input,
+      option,
+      remote,
+      meta,
+      show_input_drvs,
+      workers,
+      max_memory,
+      force_recurse,
+      gc_roots_dir,
+      socket,
+      no_daemon,
+    } => {
+      Ok(CommandPlan::Eval {
+        config: config(EvalInput {
+          flake,
+          expr,
+          file,
+          arg,
+          argstr,
+          override_input,
+          option,
+          remote,
+          meta,
+          show_input_drvs,
+          workers,
+          max_memory,
+          force_recurse,
+          gc_roots_dir,
+        })?,
+        socket,
+        use_daemon: !no_daemon,
+      })
+    },
+    Commands::Watch {
+      flake,
+      expr,
+      file,
+      arg,
+      argstr,
+      override_input,
+      option,
+      remote,
+      meta,
+      show_input_drvs,
+      workers,
+      max_memory,
+      force_recurse,
+      gc_roots_dir,
+      socket,
+      no_daemon,
+    } => {
+      let config = config(EvalInput {
+        flake,
+        expr,
+        file,
+        arg,
+        argstr,
+        override_input,
+        option,
+        remote,
+        meta,
+        show_input_drvs,
+        workers,
+        max_memory,
+        force_recurse,
+        gc_roots_dir,
+      })?;
       if matches!(config.input, Input::Expr(_)) {
         bail!("watch requires --flake or --file input");
       }
-      Ok((verbose, CommandPlan::Watch {
+      Ok(CommandPlan::Watch {
         config,
-        socket: extra.socket,
-        use_daemon: !extra.no_daemon,
-      }))
+        socket,
+        use_daemon: !no_daemon,
+      })
     },
-    "query" => {
-      let (verbose, args, extra) = parse_eval_args(rest)?;
-      Ok((verbose, CommandPlan::Query {
-        config: eval_config(args)?,
-        filter: filter(extra.systems, extra.attr_prefixes),
-        socket: extra.socket,
-      }))
+    Commands::Query {
+      flake,
+      expr,
+      file,
+      arg,
+      argstr,
+      override_input,
+      option,
+      remote,
+      meta,
+      show_input_drvs,
+      workers,
+      max_memory,
+      force_recurse,
+      gc_roots_dir,
+      socket,
+      system,
+      attr_prefix,
+      no_daemon,
+    } => {
+      let _ = no_daemon;
+      Ok(CommandPlan::Query {
+        config: config(EvalInput {
+          flake,
+          expr,
+          file,
+          arg,
+          argstr,
+          override_input,
+          option,
+          remote,
+          meta,
+          show_input_drvs,
+          workers,
+          max_memory,
+          force_recurse,
+          gc_roots_dir,
+        })?,
+        filter: filter(system, attr_prefix),
+        socket,
+      })
     },
-    "diff" => {
-      let (verbose, args, extra) = parse_eval_args(rest)?;
-      ensure_no_query_flags(&extra)?;
-      if extra.no_daemon {
-        bail!("diff does not support --no-daemon");
-      }
-      Ok((verbose, CommandPlan::Diff {
-        config: eval_config(args)?,
-        socket: extra.socket,
-      }))
+    Commands::Diff {
+      flake,
+      expr,
+      file,
+      arg,
+      argstr,
+      override_input,
+      option,
+      remote,
+      meta,
+      show_input_drvs,
+      workers,
+      max_memory,
+      force_recurse,
+      gc_roots_dir,
+      socket,
+    } => {
+      Ok(CommandPlan::Diff {
+        config: config(EvalInput {
+          flake,
+          expr,
+          file,
+          arg,
+          argstr,
+          override_input,
+          option,
+          remote,
+          meta,
+          show_input_drvs,
+          workers,
+          max_memory,
+          force_recurse,
+          gc_roots_dir,
+        })?,
+        socket,
+      })
     },
-    "daemon" => parse_daemon(rest),
-    "worker" => parse_worker(rest),
-    other => bail!("unknown command {other:?}"),
+    Commands::Daemon { socket, foreground } => {
+      Ok(CommandPlan::Daemon { socket, foreground })
+    },
+    Commands::Worker { listen } => Ok(CommandPlan::Worker { listen }),
   }
 }
 
-#[derive(Default)]
-struct ExtraArgs {
-  socket:        Option<PathBuf>,
-  no_daemon:     bool,
-  systems:       Vec<String>,
-  attr_prefixes: Vec<String>,
+struct EvalInput {
+  flake:           Option<String>,
+  expr:            Option<String>,
+  file:            Option<PathBuf>,
+  arg:             Vec<Pair>,
+  argstr:          Vec<Pair>,
+  override_input:  Vec<Pair>,
+  option:          Vec<Pair>,
+  remote:          Vec<RemoteArg>,
+  meta:            bool,
+  show_input_drvs: bool,
+  workers:         usize,
+  max_memory:      usize,
+  force_recurse:   bool,
+  gc_roots_dir:    Option<PathBuf>,
 }
 
-fn parse_eval_args(args: &[String]) -> Result<(u8, EvalArgs, ExtraArgs)> {
-  let mut eval = EvalArgs::default();
-  let mut extra = ExtraArgs::default();
-  let mut verbose = 0;
-  let mut cursor = Cursor::new(args);
-
-  while let Some(arg) = cursor.next() {
-    match flag_name(&arg).as_str() {
-      "--flake" => eval.flake = Some(cursor.value(&arg, "--flake")?),
-      "--expr" => eval.expr = Some(cursor.value(&arg, "--expr")?),
-      "--file" => {
-        eval.file = Some(PathBuf::from(cursor.value(&arg, "--file")?))
-      },
-      "--arg" => {
-        eval.arg.push(cursor.value(&arg, "--arg")?);
-        eval.arg.push(cursor.required("--arg value")?);
-      },
-      "--argstr" => {
-        eval.argstr.push(cursor.value(&arg, "--argstr")?);
-        eval.argstr.push(cursor.required("--argstr value")?);
-      },
-      "--override-input" => {
-        eval
-          .override_input
-          .push(cursor.value(&arg, "--override-input")?);
-        eval
-          .override_input
-          .push(cursor.required("--override-input value")?);
-      },
-      "--option" => {
-        eval.option.push(cursor.value(&arg, "--option")?);
-        eval.option.push(cursor.required("--option value")?);
-      },
-      "--remote" => {
-        eval.remote.push(cursor.value(&arg, "--remote")?);
-        eval.remote.push(cursor.required("--remote systems")?);
-        eval.remote.push(cursor.required("--remote workers")?);
-      },
-      "--meta" => eval.meta = true,
-      "--show-input-drvs" => eval.show_input_drvs = true,
-      "--workers" => {
-        eval.workers = cursor
-          .value(&arg, "--workers")?
-          .parse()
-          .context("parsing --workers")?;
-      },
-      "--max-memory" | "--max-memory-size" => {
-        eval.max_memory = cursor
-          .value(&arg, "--max-memory")?
-          .parse()
-          .context("parsing --max-memory")?;
-      },
-      "--force-recurse" => eval.force_recurse = true,
-      "--gc-roots-dir" => {
-        eval.gc_roots_dir =
-          Some(PathBuf::from(cursor.value(&arg, "--gc-roots-dir")?));
-      },
-      "--socket" => {
-        extra.socket = Some(PathBuf::from(cursor.value(&arg, "--socket")?));
-      },
-      "--no-daemon" => extra.no_daemon = true,
-      "--system" => extra.systems.push(cursor.value(&arg, "--system")?),
-      "--attr-prefix" => {
-        extra
-          .attr_prefixes
-          .push(cursor.value(&arg, "--attr-prefix")?);
-      },
-      "-v" | "--verbose" => verbose += 1,
-      flag
-        if flag.starts_with("-v")
-          && flag.chars().all(|c| c == '-' || c == 'v') =>
-      {
-        verbose += flag.chars().filter(|&c| c == 'v').count() as u8;
-      },
-      other => bail!("unexpected argument {other:?}"),
-    }
-  }
-
-  Ok((verbose, eval, extra))
-}
-
-fn parse_daemon(args: &[String]) -> Result<(u8, CommandPlan)> {
-  let mut cursor = Cursor::new(args);
-  let mut socket = None;
-  let mut foreground = false;
-  let mut verbose = 0;
-  while let Some(arg) = cursor.next() {
-    match flag_name(&arg).as_str() {
-      "--socket" => {
-        socket = Some(PathBuf::from(cursor.value(&arg, "--socket")?))
-      },
-      "--foreground" => foreground = true,
-      "-v" | "--verbose" => verbose += 1,
-      other => bail!("unexpected argument {other:?}"),
-    }
-  }
-  Ok((verbose, CommandPlan::Daemon { socket, foreground }))
-}
-
-fn parse_worker(args: &[String]) -> Result<(u8, CommandPlan)> {
-  let mut cursor = Cursor::new(args);
-  let mut listen = None;
-  let mut verbose = 0;
-  while let Some(arg) = cursor.next() {
-    match flag_name(&arg).as_str() {
-      "--listen" => listen = Some(cursor.value(&arg, "--listen")?),
-      "-v" | "--verbose" => verbose += 1,
-      other => bail!("unexpected argument {other:?}"),
-    }
-  }
-  let Some(listen) = listen else {
-    bail!("worker requires --listen ADDR");
-  };
-  Ok((verbose, CommandPlan::Worker { listen }))
-}
-
-struct Cursor<'a> {
-  args:  &'a [String],
-  index: usize,
-}
-
-impl<'a> Cursor<'a> {
-  fn new(args: &'a [String]) -> Self {
-    Self { args, index: 0 }
-  }
-
-  fn next(&mut self) -> Option<String> {
-    let value = self.args.get(self.index)?.clone();
-    self.index += 1;
-    Some(value)
-  }
-
-  fn value(&mut self, arg: &str, flag: &str) -> Result<String> {
-    if let Some((_, value)) = arg.split_once('=') {
-      return Ok(value.to_owned());
-    }
-    self.required(flag)
-  }
-
-  fn required(&mut self, flag: &str) -> Result<String> {
-    self
-      .next()
-      .with_context(|| format!("{flag} requires a value"))
-  }
-}
-
-fn flag_name(arg: &str) -> String {
-  arg.split_once('=').map_or(arg, |(flag, _)| flag).to_owned()
-}
-
-fn ensure_no_query_flags(extra: &ExtraArgs) -> Result<()> {
-  if !extra.systems.is_empty() {
-    bail!("--system is only valid for query");
-  }
-  if !extra.attr_prefixes.is_empty() {
-    bail!("--attr-prefix is only valid for query");
-  }
-  Ok(())
-}
-
-fn eval_config(args: EvalArgs) -> Result<Config> {
+fn config(args: EvalInput) -> Result<Config> {
   let input = match (args.flake, args.expr, args.file) {
     (Some(flake), None, None) => Input::Flake(flake),
     (None, Some(expr), None) => Input::Expr(expr),
@@ -310,72 +492,49 @@ fn eval_config(args: EvalArgs) -> Result<Config> {
 
   Ok(Config {
     input,
-    auto_args: parse_auto_args(args.arg, args.argstr)?,
+    auto_args: auto_args(args.arg, args.argstr),
     force_recurse: args.force_recurse,
     gc_roots_dir: args.gc_roots_dir,
     workers: args.workers,
     max_memory_size: args.max_memory,
     meta: args.meta,
     show_input_drvs: args.show_input_drvs,
-    override_inputs: parse_pairs(args.override_input, "--override-input")?,
-    nix_options: parse_pairs(args.option, "--option")?,
-    remotes: parse_remotes(args.remote)?,
+    override_inputs: pairs(args.override_input),
+    nix_options: pairs(args.option),
+    remotes: args
+      .remote
+      .into_iter()
+      .map(|remote| {
+        Remote {
+          endpoint: remote.endpoint,
+          systems:  remote.systems,
+          workers:  remote.workers,
+        }
+      })
+      .collect(),
   })
 }
 
-fn parse_auto_args(
-  expr_args: Vec<String>,
-  str_args: Vec<String>,
-) -> Result<Vec<(String, AutoArg)>> {
-  let mut out = Vec::new();
-  for (name, value) in parse_pairs(expr_args, "--arg")? {
-    out.push((name, AutoArg::Expr(value)));
-  }
-  for (name, value) in parse_pairs(str_args, "--argstr")? {
-    out.push((name, AutoArg::Str(value)));
-  }
-  Ok(out)
+fn auto_args(
+  expr_args: Vec<Pair>,
+  str_args: Vec<Pair>,
+) -> Vec<(String, AutoArg)> {
+  expr_args
+    .into_iter()
+    .map(|pair| (pair.name, AutoArg::Expr(pair.value)))
+    .chain(
+      str_args
+        .into_iter()
+        .map(|pair| (pair.name, AutoArg::Str(pair.value))),
+    )
+    .collect()
 }
 
-fn parse_pairs(
-  values: Vec<String>,
-  flag: &str,
-) -> Result<Vec<(String, String)>> {
-  let mut chunks = values.chunks_exact(2);
-  let pairs = chunks
-    .by_ref()
-    .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
-    .collect();
-  if !chunks.remainder().is_empty() {
-    bail!("{flag} requires paired NAME VALUE entries");
-  }
-  Ok(pairs)
-}
-
-fn parse_remotes(values: Vec<String>) -> Result<Vec<Remote>> {
-  let mut chunks = values.chunks_exact(3);
-  let mut remotes = Vec::new();
-  for chunk in chunks.by_ref() {
-    let workers = chunk[2].parse::<usize>().with_context(|| {
-      format!("parsing --remote worker count {:?}", chunk[2])
-    })?;
-    if workers == 0 {
-      bail!("--remote worker count must be greater than zero");
-    }
-    remotes.push(Remote {
-      endpoint: chunk[0].clone(),
-      systems: chunk[1]
-        .split(',')
-        .filter(|system| !system.is_empty())
-        .map(str::to_owned)
-        .collect(),
-      workers,
-    });
-  }
-  if !chunks.remainder().is_empty() {
-    bail!("--remote requires ENDPOINT SYSTEM[,SYSTEM] WORKERS entries");
-  }
-  Ok(remotes)
+fn pairs(values: Vec<Pair>) -> Vec<(String, String)> {
+  values
+    .into_iter()
+    .map(|pair| (pair.name, pair.value))
+    .collect()
 }
 
 fn filter(systems: Vec<String>, prefixes: Vec<String>) -> Filter {
@@ -394,6 +553,69 @@ fn filter(systems: Vec<String>, prefixes: Vec<String>) -> Filter {
         .collect()
     }),
   }
+}
+
+fn normalize_args<I, S>(args: I) -> Result<Vec<String>>
+where
+  I: IntoIterator<Item = S>,
+  S: Into<String>,
+{
+  let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+  let mut normalized = Vec::with_capacity(args.len());
+  let mut index = 0;
+  while index < args.len() {
+    let arg = &args[index];
+    if let Some((flag, first)) = arg.split_once('=')
+      && let Some(arity) = packed_arity(flag)
+    {
+      let values =
+        collect_packed_values(&args, &mut index, flag, arity, Some(first))?;
+      normalized.push(format!("{flag}={}", pack(&values)?));
+      continue;
+    }
+    if let Some(arity) = packed_arity(arg) {
+      let values = collect_packed_values(&args, &mut index, arg, arity, None)?;
+      normalized.push(format!("{arg}={}", pack(&values)?));
+      continue;
+    }
+    normalized.push(arg.clone());
+    index += 1;
+  }
+  Ok(normalized)
+}
+
+fn packed_arity(flag: &str) -> Option<usize> {
+  match flag {
+    "--arg" | "--argstr" | "--override-input" | "--option" => Some(2),
+    "--remote" => Some(3),
+    _ => None,
+  }
+}
+
+fn collect_packed_values(
+  args: &[String],
+  index: &mut usize,
+  flag: &str,
+  arity: usize,
+  first: Option<&str>,
+) -> Result<Vec<String>> {
+  let mut values = first.into_iter().map(str::to_owned).collect::<Vec<_>>();
+  while values.len() < arity {
+    *index += 1;
+    let Some(value) = args.get(*index) else {
+      bail!("{flag} requires {arity} values");
+    };
+    values.push(value.clone());
+  }
+  *index += 1;
+  Ok(values)
+}
+
+fn pack(values: &[String]) -> Result<String> {
+  if values.iter().any(|value| value.contains(PACK_SEP)) {
+    bail!("argument values cannot contain ASCII unit separator");
+  }
+  Ok(values.join(&PACK_SEP.to_string()))
 }
 
 #[cfg(test)]
@@ -476,5 +698,59 @@ mod tests {
     };
 
     assert!(error.contains("watch requires --flake or --file input"));
+  }
+
+  #[test]
+  fn global_and_command_verbosity_accumulate() {
+    let (verbosity, CommandPlan::Eval { .. }) =
+      parse_plan_from(["-v", "eval", "-vv", "--expr", "{}"])
+        .expect("parse eval plan")
+    else {
+      panic!("expected eval command");
+    };
+
+    assert_eq!(verbosity.verbose, 3);
+    assert_eq!(verbosity.quiet, 0);
+  }
+
+  #[test]
+  fn global_and_command_quiet_accumulate() {
+    let (verbosity, CommandPlan::Eval { .. }) =
+      parse_plan_from(["-q", "eval", "-qq", "--expr", "{}"])
+        .expect("parse eval plan")
+    else {
+      panic!("expected eval command");
+    };
+
+    assert_eq!(verbosity.verbose, 0);
+    assert_eq!(verbosity.quiet, 3);
+  }
+
+  #[test]
+  fn daemon_accepts_grouped_verbose_flags() {
+    let (verbosity, CommandPlan::Daemon { foreground, .. }) =
+      parse_plan_from(["daemon", "--foreground", "-vv"])
+        .expect("parse daemon plan")
+    else {
+      panic!("expected daemon command");
+    };
+
+    assert_eq!(verbosity.verbose, 2);
+    assert_eq!(verbosity.quiet, 0);
+    assert!(foreground);
+  }
+
+  #[test]
+  fn worker_accepts_long_verbose_flags() {
+    let (verbosity, CommandPlan::Worker { listen }) =
+      parse_plan_from(["worker", "--verbose", "--listen", "0.0.0.0:7357"])
+        .expect("parse worker plan")
+    else {
+      panic!("expected worker command");
+    };
+
+    assert_eq!(verbosity.verbose, 1);
+    assert_eq!(verbosity.quiet, 0);
+    assert_eq!(listen, "0.0.0.0:7357");
   }
 }

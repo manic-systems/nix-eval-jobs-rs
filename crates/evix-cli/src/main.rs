@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use args::{CommandPlan, parse_plan};
+use args::{CommandPlan, Verbosity, parse_plan};
 use evix::{Config, Event, Session, WORKER_ENV, json as evix_json};
 use evix_daemon as daemon;
 use evix_protocol::{Request, Response};
@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 fn main() {
   if env::var(WORKER_ENV).is_ok() {
-    init_tracing_subscriber(0);
+    init_tracing_subscriber(Verbosity::default());
     if let Err(err) = evix::run_worker() {
       eprintln!("Error: {err:?}");
       process::exit(1);
@@ -38,8 +38,8 @@ fn main() {
 fn run_cli() -> color_eyre::Result<()> {
   color_eyre::install()?;
 
-  let (verbose, plan) = parse_plan().map_err(report)?;
-  init_tracing_subscriber(verbose);
+  let (verbosity, plan) = parse_plan().map_err(report)?;
+  init_tracing_subscriber(verbosity);
   run_plan(plan).map_err(report)
 }
 
@@ -211,11 +211,14 @@ fn with_runtime<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     .block_on(future)
 }
 
-fn init_tracing_subscriber(verbose: u8) {
-  let level = match verbose {
+fn init_tracing_subscriber(verbosity: Verbosity) {
+  let level = match i16::from(verbosity.verbose) - i16::from(verbosity.quiet) {
+    i16::MIN..=-3 => "off",
+    -2 => "error",
+    -1 => "warn",
     0 => "info",
     1 => "debug",
-    _ => "trace",
+    2..=i16::MAX => "trace",
   };
 
   tracing_subscriber::fmt()
