@@ -13,7 +13,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-latest
+            system: x86_64-linux
+          - os: ubuntu-24.04-arm
+            system: aarch64-linux
     uses: manic-systems/workflows/.github/workflows/rust-checks.yml@8e0aa91fd3b74f101424d4e36ac743c8f8403a32
     with:
       os: ${{ matrix.os }}
+      flake-check-command: nix build .#packages.${{ matrix.system }}.default && nix flake check --no-build
