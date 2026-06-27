@@ -479,18 +479,18 @@ dependencies = [
 
 [[package]]
 name = "nix-bindings"
-version = "0.2347.4"
+version = "0.2347.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d95cd74fb0801ccf0457c3d6512abfa09abbc0889df43454c178cae744dd5ac"
+checksum = "48d826e02d271ca63883bee7e842423beb54a4f65c768f0a657bb1cb6ee3a3ba"
 dependencies = [
  "nix-bindings-sys",
 ]
 
 [[package]]
 name = "nix-bindings-sys"
-version = "0.2347.4"
+version = "0.2347.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f14ce1e5f49bf0a18225345f434c619e3b3a3b17e094b3e5b13dba5e5ae598a6"
+checksum = "e282076948fe9ad31c76acd5ee320b66500666bba8b2c09cdadf5b1cd4f5a057"
 dependencies = [
  "bindgen",
  "cc",
