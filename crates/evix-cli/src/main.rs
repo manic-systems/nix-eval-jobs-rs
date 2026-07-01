@@ -96,7 +96,10 @@ fn run_plan(plan: CommandPlan) -> Result<()> {
       daemon::run(daemon::socket_path(socket), foreground)
     },
     CommandPlan::Worker { listen } => {
-      with_runtime(evix::serve_remote_worker(&listen))
+      with_runtime(async {
+        evix::serve_remote_worker(&listen).await?;
+        Ok(())
+      })
     },
   }
 }
