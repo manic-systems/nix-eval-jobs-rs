@@ -6,7 +6,7 @@ use std::{
   io,
   io::{BufRead, BufReader, Write},
   os::unix::net::UnixStream,
-  path::PathBuf,
+  path::{Path, PathBuf},
   process,
 };
 
@@ -137,8 +137,16 @@ fn run_daemon_only(request: Request, socket: Option<PathBuf>) -> Result<()> {
   let socket = daemon::socket_path(socket);
   match UnixStream::connect(&socket) {
     Ok(stream) => run_daemon_request(stream, &request),
-    Err(_) => bail!("evix daemon is not running at {}", socket.display()),
+    Err(err) => Err(daemon_connect_error(&socket, err)),
   }
+}
+
+fn daemon_connect_error(socket: &Path, err: io::Error) -> anyhow::Error {
+  anyhow::Error::new(err).context(daemon_connect_context(socket))
+}
+
+fn daemon_connect_context(socket: &Path) -> String {
+  format!("connecting to evix daemon at {}", socket.display())
 }
 
 fn run_fallback(fallback: LocalFallback) -> Result<()> {
@@ -245,7 +253,12 @@ fn init_tracing_subscriber(verbosity: Verbosity) {
 
 #[cfg(test)]
 mod tests {
-  use std::thread;
+  use std::{
+    fs,
+    os::unix::net::UnixListener,
+    thread,
+    time::{SystemTime, UNIX_EPOCH},
+  };
 
   use super::*;
 
@@ -277,9 +290,104 @@ mod tests {
     handle.join().unwrap();
   }
 
+  #[test]
+  fn daemon_only_reports_missing_socket_source() {
+    let socket = unique_socket_path("missing");
+
+    let error = run_daemon_only(
+      Request::query(&Config::default(), &Default::default()),
+      Some(socket.clone()),
+    )
+    .unwrap_err();
+    let messages = error_chain_messages(&error);
+
+    assert!(
+      messages[0].contains(&format!(
+        "connecting to evix daemon at {}",
+        socket.display()
+      )),
+      "{messages:?}"
+    );
+    assert!(
+      messages.iter().any(|message| {
+        message.contains("No such file or directory")
+          || message.contains("os error 2")
+      }),
+      "{messages:?}"
+    );
+  }
+
+  #[test]
+  fn daemon_only_reports_connection_refused_source() {
+    let socket = unique_socket_path("refused");
+    let listener = UnixListener::bind(&socket).unwrap();
+    drop(listener);
+
+    let error = run_daemon_only(
+      Request::query(&Config::default(), &Default::default()),
+      Some(socket.clone()),
+    )
+    .unwrap_err();
+    let messages = error_chain_messages(&error);
+
+    assert!(
+      messages[0].contains(&format!(
+        "connecting to evix daemon at {}",
+        socket.display()
+      )),
+      "{messages:?}"
+    );
+    assert!(
+      messages.iter().any(|message| {
+        message.contains("Connection refused")
+          || message.contains("os error 111")
+      }),
+      "{messages:?}"
+    );
+
+    let _ = fs::remove_file(socket);
+  }
+
+  #[test]
+  fn daemon_only_reports_permission_denied_source() {
+    let socket = unique_socket_path("permission-denied");
+    let error = daemon_connect_error(
+      &socket,
+      io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
+    );
+    let messages = error_chain_messages(&error);
+
+    assert!(
+      messages[0].contains(&format!(
+        "connecting to evix daemon at {}",
+        socket.display()
+      )),
+      "{messages:?}"
+    );
+    assert!(
+      messages
+        .iter()
+        .any(|message| message.contains("permission denied")),
+      "{messages:?}"
+    );
+  }
+
   fn read_request_and_close(stream: UnixStream) {
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).unwrap();
     assert!(!line.trim().is_empty());
+  }
+
+  fn error_chain_messages(error: &anyhow::Error) -> Vec<String> {
+    error.chain().map(ToString::to_string).collect()
+  }
+
+  fn unique_socket_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_nanos();
+    env::temp_dir()
+      .join(format!("evix-cli-{name}-{}-{nanos}.sock", process::id()))
   }
 }
