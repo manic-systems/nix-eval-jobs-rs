@@ -143,7 +143,13 @@ fn handle_connection(
   }
 
   let request: Request =
-    serde_json::from_str(line.trim()).context("parsing daemon request")?;
+    match serde_json::from_str(line.trim()).context("parsing daemon request") {
+      Ok(request) => request,
+      Err(err) => {
+        let _ = write_response(&mut stream, &Response::error(err.to_string()));
+        return Err(err);
+      },
+    };
 
   let runtime = Builder::new_current_thread()
     .enable_io()
@@ -151,7 +157,7 @@ fn handle_connection(
     .build()
     .context("building daemon request runtime")?;
 
-  runtime.block_on(async {
+  let result = runtime.block_on(async {
     match request {
       Request::Eval { config } => {
         handle_eval(&state, &mut stream, config).await
@@ -166,7 +172,14 @@ fn handle_connection(
         handle_diff(&state, &mut stream, config).await
       },
     }
-  })
+  });
+
+  if let Err(err) = result {
+    let _ = write_response(&mut stream, &Response::error(err.to_string()));
+    return Err(err);
+  }
+
+  Ok(())
 }
 
 async fn handle_eval(
@@ -232,4 +245,41 @@ fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
   writeln!(stream)?;
   stream.flush()?;
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn missing_warm_session_returns_protocol_error() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let state = Arc::new(DaemonState::default());
+    let handle = thread::spawn(move || {
+      handle_connection(state, server).unwrap_err().to_string()
+    });
+
+    serde_json::to_writer(
+      &mut client,
+      &Request::query(&Config::default(), &Filter::default()),
+    )
+    .unwrap();
+    writeln!(client).unwrap();
+    client.flush().unwrap();
+
+    let mut line = String::new();
+    BufReader::new(client).read_line(&mut line).unwrap();
+    let response: Response = serde_json::from_str(line.trim()).unwrap();
+
+    let Response::Error { message } = response else {
+      panic!("expected error response");
+    };
+    assert!(message.contains("no warm session for requested config"));
+    assert!(
+      handle
+        .join()
+        .unwrap()
+        .contains("no warm session for requested config")
+    );
+  }
 }
