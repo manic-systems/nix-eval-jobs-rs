@@ -132,13 +132,15 @@ fn apply_nix_options(options: &[(String, String)]) -> Result<Option<PathBuf>> {
 fn build_eval_state(
   _ctx: &Arc<Context>,
   store: &Arc<Store>,
-  config: &WorkerConfig,
+  _config: &WorkerConfig,
 ) -> Result<EvalState> {
-  let mut builder =
-    EvalStateBuilder::new(store).context("eval state builder")?;
+  let builder = EvalStateBuilder::new(store).context("eval state builder")?;
 
   #[cfg(feature = "flake")]
-  if matches!(config.input, Input::Flake(_)) {
+  let mut builder = builder;
+
+  #[cfg(feature = "flake")]
+  if matches!(_config.input, Input::Flake(_)) {
     let fs = nix_bindings::flake::FlakeSettings::new(_ctx)
       .context("flake settings")?;
     builder = builder
@@ -264,6 +266,19 @@ fn eval_flake<'s>(
     current = next;
   }
   Ok(current)
+}
+
+#[cfg(not(feature = "flake"))]
+fn eval_flake<'s>(
+  _ctx: &Arc<Context>,
+  _state: &'s EvalState,
+  flake_ref_str: &str,
+  _override_inputs: &[(String, String)],
+) -> Result<Value<'s>> {
+  bail!(
+    "flake input {flake_ref_str:?} requires evix to be built with the \
+     \"flake\" feature"
+  )
 }
 
 /// Build an attrset from the configured `--arg` / `--argstr` pairs for
