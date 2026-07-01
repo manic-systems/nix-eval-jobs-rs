@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, env, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ pub use session::Session;
 
 /// Environment variable used to distinguish worker subprocesses spawned by a
 /// [`Session`]. A binary that re-executes itself to host workers should check
-/// this variable and call [`run_worker`] when it is set.
+/// this variable and enter the worker protocol when it is set.
 pub const WORKER_ENV: &str = "EVIX_WORKER";
 
 /// Input source for a Nix evaluation.
@@ -206,6 +206,20 @@ pub fn run_worker() -> anyhow::Result<()> {
     .enable_io()
     .build()?
     .block_on(worker::run())
+}
+
+/// Run the worker protocol when this process was spawned as an Evix worker.
+///
+/// Call this near the start of an embedding binary's `main`. If it returns
+/// `Ok(true)`, the process was a worker subprocess and the caller should return
+/// from `main` immediately.
+pub fn run_worker_if_requested() -> anyhow::Result<bool> {
+  if env::var_os(WORKER_ENV).is_none() {
+    return Ok(false);
+  }
+
+  run_worker()?;
+  Ok(true)
 }
 
 /// Serve remote evaluation workers over Cap'n Proto stream framing.

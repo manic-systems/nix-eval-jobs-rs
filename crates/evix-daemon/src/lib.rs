@@ -3,7 +3,10 @@ use std::{
   env,
   fs,
   io::{BufRead, BufReader, Write},
-  os::unix::net::{UnixListener, UnixStream},
+  os::unix::{
+    fs::FileTypeExt as _,
+    net::{UnixListener, UnixStream},
+  },
   path::{Path, PathBuf},
   process,
   sync::{Arc, Mutex},
@@ -66,15 +69,7 @@ pub fn run(socket: PathBuf, foreground: bool) -> Result<()> {
     daemonize(&socket)?;
   }
 
-  if let Some(parent) = socket.parent() {
-    fs::create_dir_all(parent).with_context(|| {
-      format!("creating socket directory {}", parent.display())
-    })?;
-  }
-  if socket.exists() {
-    fs::remove_file(&socket)
-      .with_context(|| format!("removing stale socket {}", socket.display()))?;
-  }
+  prepare_socket_path(&socket)?;
 
   let listener = UnixListener::bind(&socket)
     .with_context(|| format!("binding {}", socket.display()))?;
@@ -95,6 +90,46 @@ pub fn run(socket: PathBuf, foreground: bool) -> Result<()> {
     }
   }
 
+  Ok(())
+}
+
+fn prepare_socket_path(socket: &Path) -> Result<()> {
+  if let Some(parent) = socket
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+  {
+    fs::create_dir_all(parent).with_context(|| {
+      format!("creating socket directory {}", parent.display())
+    })?;
+  }
+
+  let metadata = match fs::symlink_metadata(socket) {
+    Ok(metadata) => metadata,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    Err(err) => {
+      return Err(err).with_context(|| {
+        format!("checking existing socket path {}", socket.display())
+      });
+    },
+  };
+
+  if !metadata.file_type().is_socket() {
+    bail!("refusing to remove non-socket path {}", socket.display());
+  }
+
+  match UnixStream::connect(socket) {
+    Ok(_) => bail!("live daemon socket already exists at {}", socket.display()),
+    Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {},
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    Err(err) => {
+      return Err(err).with_context(|| {
+        format!("probing existing socket {}", socket.display())
+      });
+    },
+  }
+
+  fs::remove_file(socket)
+    .with_context(|| format!("removing stale socket {}", socket.display()))?;
   Ok(())
 }
 
@@ -249,6 +284,8 @@ fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+  use std::time::{SystemTime, UNIX_EPOCH};
+
   use super::*;
 
   #[test]
@@ -281,5 +318,61 @@ mod tests {
         .unwrap()
         .contains("no warm session for requested config")
     );
+  }
+
+  #[test]
+  fn socket_startup_refuses_non_socket_path() {
+    let path = unique_socket_path("regular-file");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "keep").unwrap();
+
+    let error = prepare_socket_path(&path).unwrap_err().to_string();
+
+    assert!(error.contains("refusing to remove non-socket path"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "keep");
+    cleanup_socket_path(&path);
+  }
+
+  #[test]
+  fn socket_startup_reports_live_socket() {
+    let path = unique_socket_path("live-socket");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(&path).unwrap();
+
+    let error = prepare_socket_path(&path).unwrap_err().to_string();
+
+    assert!(error.contains("live daemon socket already exists"));
+    assert!(path.exists());
+    drop(listener);
+    cleanup_socket_path(&path);
+  }
+
+  #[test]
+  fn socket_startup_removes_stale_socket() {
+    let path = unique_socket_path("stale-socket");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    drop(UnixListener::bind(&path).unwrap());
+
+    prepare_socket_path(&path).unwrap();
+
+    assert!(!path.exists());
+    cleanup_socket_path(&path);
+  }
+
+  fn unique_socket_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_nanos();
+    env::temp_dir()
+      .join(format!("evix-daemon-{name}-{}-{nanos}", process::id()))
+      .join("evix.sock")
+  }
+
+  fn cleanup_socket_path(path: &Path) {
+    let _ = fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+      let _ = fs::remove_dir_all(parent);
+    }
   }
 }
