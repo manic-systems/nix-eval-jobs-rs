@@ -334,11 +334,24 @@ Evaluation errors are events too. They are non-fatal unless `fatal` is `true`:
 
 ## Library Usage
 
-Use `evix::Session` when embedding Evix in another Rust service:
+Use `evix::Session` when embedding Evix in another Rust service. Call
+`run_worker_if_requested` before starting the host application so Evix worker
+subprocesses enter the worker protocol after re-exec:
 
 ```rust
-use evix::{Config, Filter, Input, Session};
+use evix::{Config, Filter, Input, Session, run_worker_if_requested};
 use futures_util::StreamExt;
+
+fn main() -> anyhow::Result<()> {
+    if run_worker_if_requested()? {
+        return Ok(());
+    }
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?
+        .block_on(example())
+}
 
 async fn example() -> anyhow::Result<()> {
     let config = Config {
@@ -369,10 +382,6 @@ async fn example() -> anyhow::Result<()> {
 `Session::stream` is single-use. Drain it once to populate the warm graph before
 calling `query_snapshot` or `diff_once`; `Session::watch` can start and drain
 the initial evaluation itself before emitting diffs.
-
-If your binary re-executes itself to host workers, check `evix::WORKER_ENV` on
-startup and call `evix::run_worker()` when it is set. The `evix` CLI does this
-already.
 
 ## Hacking
 
