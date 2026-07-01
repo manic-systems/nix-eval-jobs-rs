@@ -306,7 +306,7 @@ fn read_constituents(value: &Value<'_>) -> Option<Vec<String>> {
 fn read_input_drvs(
   store: &Store,
   drv_path: &StorePath,
-) -> BTreeMap<String, serde_json::Value> {
+) -> BTreeMap<String, Vec<String>> {
   let mut map = BTreeMap::new();
   let drv = match store.read_derivation(drv_path) {
     Ok(drv) => drv,
@@ -352,13 +352,18 @@ fn read_input_drvs(
     } else {
       format!("{store_dir}/{key}")
     };
-    let outputs = value
-      .get("outputs")
-      .cloned()
-      .unwrap_or_else(|| value.clone());
+    let Some(outputs) = input_drv_outputs(value) else {
+      warn!(drv_path = %full_path, "failed to parse inputDrvs outputs");
+      continue;
+    };
     map.insert(full_path, outputs);
   }
   map
+}
+
+fn input_drv_outputs(value: &serde_json::Value) -> Option<Vec<String>> {
+  let outputs = value.get("outputs").unwrap_or(value);
+  serde_json::from_value(outputs.clone()).ok()
 }
 
 /// Collect each output's store path from a derivation value.
