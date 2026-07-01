@@ -13,7 +13,7 @@ use std::{
   thread,
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use evix::{Config, Filter, Session};
 use evix_protocol::{Request, Response};
 use futures_util::StreamExt as _;
@@ -65,15 +65,13 @@ pub fn socket_path(flag: Option<PathBuf>) -> PathBuf {
 }
 
 pub fn run(socket: PathBuf, foreground: bool) -> Result<()> {
-  if !foreground {
-    daemonize(&socket)?;
-  }
+  let mut reporter: Box<dyn StartupReporter> = if foreground {
+    Box::new(NoopStartupReporter)
+  } else {
+    Box::new(daemonize(&socket)?)
+  };
 
-  prepare_socket_path(&socket)?;
-
-  let listener = UnixListener::bind(&socket)
-    .with_context(|| format!("binding {}", socket.display()))?;
-  info!(socket = %socket.display(), "evix daemon listening");
+  let listener = bind_listener(&socket, reporter.as_mut())?;
   let state = Arc::new(DaemonState::default());
 
   for conn in listener.incoming() {
@@ -91,6 +89,26 @@ pub fn run(socket: PathBuf, foreground: bool) -> Result<()> {
   }
 
   Ok(())
+}
+
+fn bind_listener(
+  socket: &Path,
+  reporter: &mut dyn StartupReporter,
+) -> Result<UnixListener> {
+  let listener = match prepare_socket_path(socket).and_then(|()| {
+    UnixListener::bind(socket)
+      .with_context(|| format!("binding {}", socket.display()))
+  }) {
+    Ok(listener) => listener,
+    Err(err) => {
+      let _ = reporter.error(&err);
+      return Err(err);
+    },
+  };
+
+  reporter.ready(socket)?;
+  info!(socket = %socket.display(), "evix daemon listening");
+  Ok(listener)
 }
 
 fn prepare_socket_path(socket: &Path) -> Result<()> {
@@ -133,33 +151,117 @@ fn prepare_socket_path(socket: &Path) -> Result<()> {
   Ok(())
 }
 
-fn daemonize(socket: &Path) -> Result<()> {
+trait StartupReporter {
+  fn ready(&mut self, socket: &Path) -> Result<()>;
+  fn error(&mut self, err: &anyhow::Error) -> Result<()>;
+}
+
+struct NoopStartupReporter;
+
+impl StartupReporter for NoopStartupReporter {
+  fn ready(&mut self, _socket: &Path) -> Result<()> {
+    Ok(())
+  }
+
+  fn error(&mut self, _err: &anyhow::Error) -> Result<()> {
+    Ok(())
+  }
+}
+
+struct PipeStartupReporter {
+  stream: UnixStream,
+}
+
+impl PipeStartupReporter {
+  fn new(stream: UnixStream) -> Self {
+    Self { stream }
+  }
+}
+
+impl StartupReporter for PipeStartupReporter {
+  fn ready(&mut self, _socket: &Path) -> Result<()> {
+    write_response(&mut self.stream, &Response::Done)
+  }
+
+  fn error(&mut self, err: &anyhow::Error) -> Result<()> {
+    write_response(&mut self.stream, &Response::error(err.to_string()))
+  }
+}
+
+fn daemonize(socket: &Path) -> Result<PipeStartupReporter> {
+  let (reader, writer) =
+    UnixStream::pair().context("creating daemon readiness pipe")?;
+
   let pid = unsafe { libc::fork() };
   if pid < 0 {
     bail!("fork failed");
   }
   if pid > 0 {
-    println!("{}", socket.display());
-    process::exit(0);
+    drop(writer);
+    wait_for_readiness(socket, reader);
   }
 
+  drop(reader);
+  let reporter = PipeStartupReporter::new(writer);
+
   if unsafe { libc::setsid() } < 0 {
-    bail!("setsid failed");
+    exit_after_startup_error(reporter, anyhow!("setsid failed"));
   }
 
   let pid = unsafe { libc::fork() };
   if pid < 0 {
-    bail!("second fork failed");
+    exit_after_startup_error(reporter, anyhow!("second fork failed"));
   }
   if pid > 0 {
     process::exit(0);
   }
 
   let pid_path = pid_path();
-  fs::write(&pid_path, process::id().to_string())
-    .with_context(|| format!("writing pid file {}", pid_path.display()))?;
+  if let Err(err) = fs::write(&pid_path, process::id().to_string())
+    .with_context(|| format!("writing pid file {}", pid_path.display()))
+  {
+    exit_after_startup_error(reporter, err);
+  }
 
-  Ok(())
+  Ok(reporter)
+}
+
+fn wait_for_readiness(socket: &Path, reader: UnixStream) -> ! {
+  let mut line = String::new();
+  let result = BufReader::new(reader)
+    .read_line(&mut line)
+    .context("reading daemon readiness")
+    .and_then(|_| {
+      serde_json::from_str::<Response>(line.trim())
+        .context("parsing daemon readiness")
+    });
+
+  match result {
+    Ok(Response::Done) => {
+      println!("{}", socket.display());
+      process::exit(0);
+    },
+    Ok(Response::Error { message }) => {
+      eprintln!("{message}");
+      process::exit(1);
+    },
+    Ok(other) => {
+      eprintln!("unexpected daemon readiness response: {other:?}");
+      process::exit(1);
+    },
+    Err(err) => {
+      eprintln!("{err:?}");
+      process::exit(1);
+    },
+  }
+}
+
+fn exit_after_startup_error(
+  mut reporter: PipeStartupReporter,
+  err: anyhow::Error,
+) -> ! {
+  let _ = reporter.error(&err);
+  process::exit(1);
 }
 
 fn pid_path() -> PathBuf {
@@ -359,6 +461,34 @@ mod tests {
     cleanup_socket_path(&path);
   }
 
+  #[test]
+  fn readiness_reports_bind_failure() {
+    let path = unique_socket_path("bind-failure");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let path = path.parent().unwrap().join("a".repeat(200));
+    let mut reporter = RecordingStartupReporter::default();
+
+    let error = bind_listener(&path, &mut reporter).unwrap_err().to_string();
+
+    assert!(error.contains("binding"));
+    assert!(reporter.error.unwrap().contains("binding"));
+    cleanup_socket_path(&path);
+  }
+
+  #[test]
+  fn readiness_reports_successful_background_startup() {
+    let path = unique_socket_path("ready");
+    let mut reporter = RecordingStartupReporter::default();
+
+    let listener = bind_listener(&path, &mut reporter).unwrap();
+
+    assert_eq!(reporter.ready, Some(path.clone()));
+    assert!(reporter.error.is_none());
+    assert!(path.exists());
+    drop(listener);
+    cleanup_socket_path(&path);
+  }
+
   fn unique_socket_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
       .duration_since(UNIX_EPOCH)
@@ -373,6 +503,24 @@ mod tests {
     let _ = fs::remove_file(path);
     if let Some(parent) = path.parent() {
       let _ = fs::remove_dir_all(parent);
+    }
+  }
+
+  #[derive(Default)]
+  struct RecordingStartupReporter {
+    ready: Option<PathBuf>,
+    error: Option<String>,
+  }
+
+  impl StartupReporter for RecordingStartupReporter {
+    fn ready(&mut self, socket: &Path) -> Result<()> {
+      self.ready = Some(socket.to_path_buf());
+      Ok(())
+    }
+
+    fn error(&mut self, err: &anyhow::Error) -> Result<()> {
+      self.error = Some(err.to_string());
+      Ok(())
     }
   }
 }
