@@ -388,6 +388,12 @@ when the embedding application needs backpressure. These variants keep at most
 `capacity` pending results, with `0` treated as `1`, and pause delivery while
 the receiver catches up.
 
+`Filter` can narrow warm queries by systems, a legacy single `attr_prefix`,
+multiple `attr_prefixes`, exact `attrs`, derivation `names`, and exact
+`drv_paths`, plus attr-path `include_patterns` and `exclude_patterns` using `*`
+and `?` wildcards. Multiple populated filter fields are combined as
+intersections.
+
 Serializing `evix::Event` directly with serde preserves the Rust enum shape,
 such as `{ "derivation": { ... } }` or `{ "attr_set": { ... } }`. Use
 `evix::json::event_value` or `evix::json::event_line` when you want the
