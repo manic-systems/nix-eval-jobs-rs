@@ -150,6 +150,8 @@ fn run_daemon_request(mut stream: UnixStream, request: &Request) -> Result<()> {
   writeln!(stream)?;
   stream.flush()?;
 
+  let expect_done = !matches!(request, Request::Watch { .. });
+  let mut saw_done = false;
   let reader = BufReader::new(stream);
   for line in reader.lines() {
     let line = line?;
@@ -161,9 +163,16 @@ fn run_daemon_request(mut stream: UnixStream, request: &Request) -> Result<()> {
         println!("{}", evix_json::event_line(&event))
       },
       Response::Diff { diff } => println!("{}", evix_json::diff_line(&diff)),
-      Response::Done => break,
+      Response::Done => {
+        saw_done = true;
+        break;
+      },
       Response::Error { message } => bail!("{message}"),
     }
+  }
+
+  if expect_done && !saw_done {
+    bail!("daemon closed connection before completing request");
   }
 
   Ok(())
@@ -229,4 +238,45 @@ fn init_tracing_subscriber(verbosity: Verbosity) {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
     )
     .init();
+}
+
+#[cfg(test)]
+mod tests {
+  use std::thread;
+
+  use super::*;
+
+  #[test]
+  fn finite_daemon_request_rejects_eof_before_done() {
+    let (client, server) = UnixStream::pair().unwrap();
+    let handle = thread::spawn(move || read_request_and_close(server));
+
+    let error = run_daemon_request(
+      client,
+      &Request::query(&Config::default(), &Default::default()),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+      error.contains("daemon closed connection before completing request")
+    );
+    handle.join().unwrap();
+  }
+
+  #[test]
+  fn watch_daemon_request_allows_eof_without_done() {
+    let (client, server) = UnixStream::pair().unwrap();
+    let handle = thread::spawn(move || read_request_and_close(server));
+
+    run_daemon_request(client, &Request::watch(&Config::default())).unwrap();
+
+    handle.join().unwrap();
+  }
+
+  fn read_request_and_close(stream: UnixStream) {
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    assert!(!line.trim().is_empty());
+  }
 }
