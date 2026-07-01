@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Result as AnyhowResult, anyhow};
 use futures_channel::mpsc as futures_mpsc;
 use futures_core::Stream;
+use futures_util::SinkExt as _;
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, error};
 
@@ -89,10 +90,12 @@ impl Session {
           Arc::clone(&state),
           Arc::clone(&completed),
           move |event| {
-            event_tx
-              .unbounded_send(Ok(event))
-              .map_err(|_| anyhow!("session stream receiver was dropped"))?;
-            Ok(())
+            let event_tx = event_tx.clone();
+            async move {
+              event_tx
+                .unbounded_send(Ok(event))
+                .map_err(|_| anyhow!("session stream receiver was dropped"))
+            }
           },
         )
         .await
@@ -100,6 +103,66 @@ impl Session {
           let message = err.to_string();
           record_initial_error(&state, &completed, &initial, message).await;
           let _ = tx.unbounded_send(Err(Error::from(err)));
+        } else {
+          finish_initial_evaluation(&initial);
+        }
+      },
+      spawn_state,
+      spawn_completed,
+      spawn_initial,
+    );
+
+    rx
+  }
+
+  /// Stream events with a bounded result buffer.
+  ///
+  /// When the buffer is full, evaluation waits until the receiver consumes an
+  /// item. A capacity of `0` is treated as `1`.
+  pub fn stream_bounded(
+    &self,
+    capacity: usize,
+  ) -> impl Stream<Item = Result<Event>> + '_ {
+    let (mut tx, rx) = futures_mpsc::channel(bounded_capacity(capacity));
+
+    if !self.start_initial_evaluation() {
+      let _ = tx.try_send(Err(Error::SessionStreamConsumed));
+      return rx;
+    }
+
+    let config = self.config.clone();
+    let cancel = Arc::clone(&self.cancel);
+    let state = Arc::clone(&self.state);
+    let completed = Arc::clone(&self.completed);
+    let initial = Arc::clone(&self.initial);
+    let spawn_state = Arc::clone(&state);
+    let spawn_completed = Arc::clone(&completed);
+    let spawn_initial = Arc::clone(&initial);
+
+    spawn_session_task_bounded(
+      tx.clone(),
+      async move {
+        let event_tx = tx.clone();
+        if let Err(err) = evaluate_initial(
+          config,
+          cancel,
+          Arc::clone(&state),
+          Arc::clone(&completed),
+          move |event| {
+            let mut event_tx = event_tx.clone();
+            async move {
+              event_tx
+                .send(Ok(event))
+                .await
+                .map_err(|_| anyhow!("session stream receiver was dropped"))
+            }
+          },
+        )
+        .await
+        {
+          let message = err.to_string();
+          record_initial_error(&state, &completed, &initial, message).await;
+          let _ = tx.send(Err(Error::from(err))).await;
         } else {
           finish_initial_evaluation(&initial);
         }
@@ -138,7 +201,7 @@ impl Session {
             Arc::clone(&cancel),
             Arc::clone(&state),
             Arc::clone(&completed),
-            |_| Ok(()),
+            |_| async { Ok(()) },
           )
           .await
         {
@@ -154,6 +217,66 @@ impl Session {
           watch::watch_loop(config, cancel, state, completed, tx.clone()).await
         {
           let _ = tx.unbounded_send(Err(Error::from(err)));
+        }
+      },
+      spawn_state,
+      spawn_completed,
+      spawn_initial,
+    );
+
+    rx
+  }
+
+  /// Stream diffs with a bounded result buffer.
+  ///
+  /// When the buffer is full, watch delivery waits until the receiver consumes
+  /// an item. A capacity of `0` is treated as `1`.
+  pub fn watch_bounded(
+    &self,
+    capacity: usize,
+  ) -> impl Stream<Item = Result<Diff>> + '_ {
+    let (mut tx, rx) = futures_mpsc::channel(bounded_capacity(capacity));
+    let config = self.config.clone();
+    let cancel = Arc::clone(&self.cancel);
+    let state = Arc::clone(&self.state);
+    let completed = Arc::clone(&self.completed);
+    let initial = Arc::clone(&self.initial);
+    let start_initial = self.start_initial_evaluation();
+    let spawn_state = Arc::clone(&state);
+    let spawn_completed = Arc::clone(&completed);
+    let spawn_initial = Arc::clone(&initial);
+
+    spawn_session_task_bounded(
+      tx.clone(),
+      async move {
+        if start_initial
+          && let Err(err) = evaluate_initial(
+            config.clone(),
+            Arc::clone(&cancel),
+            Arc::clone(&state),
+            Arc::clone(&completed),
+            |_| async { Ok(()) },
+          )
+          .await
+        {
+          let message = err.to_string();
+          record_initial_error(&state, &completed, &initial, message).await;
+          let _ = tx.send(Err(Error::from(err))).await;
+          return;
+        } else if start_initial {
+          finish_initial_evaluation(&initial);
+        }
+
+        if let Err(err) = watch::watch_loop_bounded(
+          config,
+          cancel,
+          state,
+          completed,
+          tx.clone(),
+        )
+        .await
+        {
+          let _ = tx.send(Err(Error::from(err))).await;
         }
       },
       spawn_state,
@@ -255,7 +378,7 @@ impl Session {
   }
 }
 
-async fn evaluate_initial<F>(
+async fn evaluate_initial<F, Fut>(
   config: Config,
   cancel: Arc<AtomicBool>,
   state: Arc<RwLock<WarmState>>,
@@ -263,10 +386,11 @@ async fn evaluate_initial<F>(
   on_event: F,
 ) -> AnyhowResult<()>
 where
-  F: FnMut(Event) -> AnyhowResult<()> + Send + 'static,
+  F: FnMut(Event) -> Fut + Send + 'static,
+  Fut: Future<Output = AnyhowResult<()>>,
 {
   debug!("starting session evaluation");
-  let result = run::evaluate(config, Arc::clone(&cancel), on_event).await;
+  let result = run::evaluate_async(config, Arc::clone(&cancel), on_event).await;
 
   match result {
     Ok((graph, errors)) => {
@@ -329,6 +453,35 @@ fn spawn_session_task<T: Send + 'static>(
       }));
     },
   }
+}
+
+fn spawn_session_task_bounded<T: Send + 'static>(
+  mut tx: futures_mpsc::Sender<Result<T>>,
+  future: impl Future<Output = ()> + Send + 'static,
+  state: Arc<RwLock<WarmState>>,
+  completed: Arc<Notify>,
+  initial: Arc<Mutex<InitialEvaluation>>,
+) {
+  match tokio::runtime::Handle::try_current() {
+    Ok(handle) => {
+      handle.spawn(future);
+    },
+    Err(_) => {
+      let message = "Session streams require an active Tokio runtime";
+      if let Ok(mut state) = state.try_write() {
+        state.error = Some(message.into());
+      }
+      finish_initial_evaluation(&initial);
+      completed.notify_waiters();
+      let _ = tx.try_send(Err(Error::RuntimeUnavailable {
+        message: message.into(),
+      }));
+    },
+  }
+}
+
+fn bounded_capacity(capacity: usize) -> usize {
+  capacity.max(1)
 }
 
 impl Drop for Session {
@@ -409,6 +562,32 @@ mod tests {
       runtime.block_on(async { stream.next().await.unwrap().unwrap_err() });
 
     assert!(matches!(error, Error::SessionStreamConsumed));
+  }
+
+  #[test]
+  fn duplicate_bounded_stream_uses_matchable_error() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    let session = Session {
+      config:    Config::default(),
+      cancel:    Arc::new(AtomicBool::new(false)),
+      state:     Arc::new(RwLock::new(WarmState::default())),
+      completed: Arc::new(Notify::new()),
+      initial:   Arc::new(Mutex::new(InitialEvaluation::Finished)),
+    };
+    let mut stream = Box::pin(session.stream_bounded(1));
+
+    let error =
+      runtime.block_on(async { stream.next().await.unwrap().unwrap_err() });
+
+    assert!(matches!(error, Error::SessionStreamConsumed));
+  }
+
+  #[test]
+  fn bounded_capacity_has_minimum_one() {
+    assert_eq!(bounded_capacity(0), 1);
+    assert_eq!(bounded_capacity(8), 8);
   }
 
   #[test]

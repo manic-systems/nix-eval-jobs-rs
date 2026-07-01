@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context as _, Result as AnyhowResult, anyhow, bail};
 use futures_channel::mpsc as futures_mpsc;
+use futures_util::SinkExt as _;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::{
   sync::{Notify, RwLock, mpsc as tokio_mpsc},
@@ -31,6 +32,40 @@ pub async fn watch_loop(
   state: Arc<RwLock<WarmState>>,
   completed: Arc<Notify>,
   tx: futures_mpsc::UnboundedSender<crate::Result<Diff>>,
+) -> AnyhowResult<()> {
+  watch_loop_with_sender(
+    config,
+    cancel,
+    state,
+    completed,
+    WatchSender::Unbounded(tx),
+  )
+  .await
+}
+
+pub async fn watch_loop_bounded(
+  config: Config,
+  cancel: Arc<AtomicBool>,
+  state: Arc<RwLock<WarmState>>,
+  completed: Arc<Notify>,
+  tx: futures_mpsc::Sender<crate::Result<Diff>>,
+) -> AnyhowResult<()> {
+  watch_loop_with_sender(
+    config,
+    cancel,
+    state,
+    completed,
+    WatchSender::Bounded(tx),
+  )
+  .await
+}
+
+async fn watch_loop_with_sender(
+  config: Config,
+  cancel: Arc<AtomicBool>,
+  state: Arc<RwLock<WarmState>>,
+  completed: Arc<Notify>,
+  mut tx: WatchSender,
 ) -> AnyhowResult<()> {
   wait_for_initial_evaluation(&cancel, &state, &completed).await?;
 
@@ -69,14 +104,11 @@ pub async fn watch_loop(
           state.completed = true;
           state.error = None;
         }
-        tx.unbounded_send(Ok(diff))
-          .map_err(|_| anyhow!("watch stream receiver was dropped"))?;
+        tx.send(Ok(diff)).await?;
       },
       Ok(Some(Err(err))) => {
-        tx.unbounded_send(Err(Error::from(anyhow!(
-          "filesystem watch error: {err}"
-        ))))
-        .map_err(|_| anyhow!("watch stream receiver was dropped"))?;
+        tx.send(Err(Error::from(anyhow!("filesystem watch error: {err}"))))
+          .await?;
       },
       Ok(None) => bail!("filesystem watcher disconnected"),
       Err(_) => {},
@@ -84,6 +116,27 @@ pub async fn watch_loop(
   }
 
   Ok(())
+}
+
+enum WatchSender {
+  Unbounded(futures_mpsc::UnboundedSender<crate::Result<Diff>>),
+  Bounded(futures_mpsc::Sender<crate::Result<Diff>>),
+}
+
+impl WatchSender {
+  async fn send(&mut self, item: crate::Result<Diff>) -> AnyhowResult<()> {
+    match self {
+      Self::Unbounded(tx) => {
+        tx.unbounded_send(item)
+          .map_err(|_| anyhow!("watch stream receiver was dropped"))
+      },
+      Self::Bounded(tx) => {
+        tx.send(item)
+          .await
+          .map_err(|_| anyhow!("watch stream receiver was dropped"))
+      },
+    }
+  }
 }
 
 async fn wait_for_initial_evaluation(
