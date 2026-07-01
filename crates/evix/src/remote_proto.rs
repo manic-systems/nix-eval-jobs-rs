@@ -340,10 +340,10 @@ fn set_derivation(
   let mut input_drvs = builder
     .reborrow()
     .init_input_drvs(derivation.input_drvs.len() as u32);
-  for (index, (drv_path, value)) in derivation.input_drvs.iter().enumerate() {
+  for (index, (drv_path, outputs)) in derivation.input_drvs.iter().enumerate() {
     let mut input_drv = input_drvs.reborrow().get(index as u32);
     input_drv.set_drv_path(drv_path);
-    input_drv.set_value_json(&serde_json::to_string(value)?);
+    input_drv.set_value_json(&serde_json::to_string(outputs)?);
   }
 
   match &derivation.constituents {
@@ -385,8 +385,10 @@ fn read_derivation(
     let input_drv = input_drvs.get(index);
     input_drv_map.insert(
       input_drv.get_drv_path()?.to_string()?,
-      serde_json::from_str(input_drv.get_value_json()?.to_str()?)
-        .context("parsing inputDrv JSON value")?,
+      serde_json::from_str::<Vec<String>>(
+        input_drv.get_value_json()?.to_str()?,
+      )
+      .context("parsing inputDrv outputs")?,
     );
   }
 

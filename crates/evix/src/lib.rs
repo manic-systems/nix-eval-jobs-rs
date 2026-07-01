@@ -268,9 +268,10 @@ pub struct Derivation {
   pub meta:          Option<serde_json::Value>,
   /// Input derivations keyed by `.drv` store path, present only when
   /// [`Config::show_input_drvs`] is set. The value is the output-name list for
-  /// that derivation input (e.g., `["out"]`).
+  /// that derivation input (e.g., `["out"]`). Serialized as the CLI-compatible
+  /// `inputDrvs` object.
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-  pub input_drvs:    BTreeMap<String, serde_json::Value>,
+  pub input_drvs:    BTreeMap<String, Vec<String>>,
   /// Constituent attribute names for an aggregate job (Hydra
   /// `constituents`), present only when the derivation declares them.
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,6 +306,12 @@ pub struct Filter {
 }
 
 /// Event produced while traversing a Nix expression.
+///
+/// Direct serde serialization preserves this enum shape, e.g.
+/// `{ "derivation": { ... } }`, `{ "attr_set": { ... } }`, or
+/// `{ "error": { ... } }`. The CLI NDJSON format is intentionally flattened
+/// for compatibility with `nix-eval-jobs`; use [`json::event_value`] or
+/// [`json::event_line`] for that flattened shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
