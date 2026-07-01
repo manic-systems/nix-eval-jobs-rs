@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, env, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 mod async_master;
+mod error;
 mod eval;
 pub mod json;
 mod remote_proto;
@@ -21,6 +22,7 @@ mod worker_capnp {
   include!(concat!(env!("OUT_DIR"), "/worker_capnp.rs"));
 }
 
+pub use error::{Error, Result};
 pub use session::Session;
 
 /// Environment variable used to distinguish worker subprocesses spawned by a
@@ -101,6 +103,144 @@ impl Default for Config {
       nix_options:     Vec::new(),
       remotes:         Vec::new(),
     }
+  }
+}
+
+impl Config {
+  /// Create a config that evaluates a Nix expression string.
+  pub fn expr(expr: impl Into<String>) -> Self {
+    Self {
+      input: Input::Expr(expr.into()),
+      ..Self::default()
+    }
+  }
+
+  /// Create a config that evaluates a Nix file path.
+  pub fn file(path: impl Into<PathBuf>) -> Self {
+    Self {
+      input: Input::File(path.into()),
+      ..Self::default()
+    }
+  }
+
+  /// Create a config that evaluates a flake reference.
+  pub fn flake(reference: impl Into<String>) -> Self {
+    Self {
+      input: Input::Flake(reference.into()),
+      ..Self::default()
+    }
+  }
+
+  /// Start a chainable builder from this config.
+  pub fn builder(self) -> ConfigBuilder {
+    ConfigBuilder { config: self }
+  }
+}
+
+/// Chainable builder for [`Config`].
+#[derive(Debug, Clone)]
+pub struct ConfigBuilder {
+  config: Config,
+}
+
+impl ConfigBuilder {
+  /// Start a builder for a Nix expression input.
+  pub fn expr(expr: impl Into<String>) -> Self {
+    Config::expr(expr).builder()
+  }
+
+  /// Start a builder for a Nix file input.
+  pub fn file(path: impl Into<PathBuf>) -> Self {
+    Config::file(path).builder()
+  }
+
+  /// Start a builder for a flake reference input.
+  pub fn flake(reference: impl Into<String>) -> Self {
+    Config::flake(reference).builder()
+  }
+
+  pub fn force_recurse(mut self, enabled: bool) -> Self {
+    self.config.force_recurse = enabled;
+    self
+  }
+
+  pub fn gc_roots_dir(mut self, path: impl Into<PathBuf>) -> Self {
+    self.config.gc_roots_dir = Some(path.into());
+    self
+  }
+
+  pub fn workers(mut self, workers: usize) -> Self {
+    self.config.workers = workers;
+    self
+  }
+
+  pub fn max_memory_size(mut self, size: usize) -> Self {
+    self.config.max_memory_size = size;
+    self
+  }
+
+  pub fn meta(mut self, enabled: bool) -> Self {
+    self.config.meta = enabled;
+    self
+  }
+
+  pub fn show_input_drvs(mut self, enabled: bool) -> Self {
+    self.config.show_input_drvs = enabled;
+    self
+  }
+
+  pub fn auto_arg_expr(
+    mut self,
+    name: impl Into<String>,
+    value: impl Into<String>,
+  ) -> Self {
+    self
+      .config
+      .auto_args
+      .push((name.into(), AutoArg::Expr(value.into())));
+    self
+  }
+
+  pub fn auto_arg_str(
+    mut self,
+    name: impl Into<String>,
+    value: impl Into<String>,
+  ) -> Self {
+    self
+      .config
+      .auto_args
+      .push((name.into(), AutoArg::Str(value.into())));
+    self
+  }
+
+  pub fn override_input(
+    mut self,
+    name: impl Into<String>,
+    reference: impl Into<String>,
+  ) -> Self {
+    self
+      .config
+      .override_inputs
+      .push((name.into(), reference.into()));
+    self
+  }
+
+  pub fn nix_option(
+    mut self,
+    key: impl Into<String>,
+    value: impl Into<String>,
+  ) -> Self {
+    self.config.nix_options.push((key.into(), value.into()));
+    self
+  }
+
+  pub fn remote(mut self, remote: Remote) -> Self {
+    self.config.remotes.push(remote);
+    self
+  }
+
+  pub fn build(self) -> Config {
+    self.config
   }
 }
 
@@ -201,11 +341,16 @@ impl Event {
 ///
 /// Reads a typed setup message from stdin, then processes attribute paths
 /// requested by the master process.
-pub fn run_worker() -> anyhow::Result<()> {
-  tokio::runtime::Builder::new_current_thread()
+pub fn run_worker() -> Result<()> {
+  let runtime = tokio::runtime::Builder::new_current_thread()
     .enable_io()
-    .build()?
-    .block_on(worker::run())
+    .build()
+    .map_err(|err| {
+      Error::Internal {
+        message: err.to_string(),
+      }
+    })?;
+  runtime.block_on(worker::run()).map_err(Error::from)
 }
 
 /// Run the worker protocol when this process was spawned as an Evix worker.
@@ -213,7 +358,7 @@ pub fn run_worker() -> anyhow::Result<()> {
 /// Call this near the start of an embedding binary's `main`. If it returns
 /// `Ok(true)`, the process was a worker subprocess and the caller should return
 /// from `main` immediately.
-pub fn run_worker_if_requested() -> anyhow::Result<bool> {
+pub fn run_worker_if_requested() -> Result<bool> {
   if env::var_os(WORKER_ENV).is_none() {
     return Ok(false);
   }
@@ -223,6 +368,65 @@ pub fn run_worker_if_requested() -> anyhow::Result<bool> {
 }
 
 /// Serve remote evaluation workers over Cap'n Proto stream framing.
-pub async fn serve_remote_worker(addr: &str) -> anyhow::Result<()> {
-  remote_worker::serve(addr).await
+pub async fn serve_remote_worker(addr: &str) -> Result<()> {
+  remote_worker::serve(addr).await.map_err(Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn config_constructors_set_input_and_defaults() {
+    let expr = Config::expr("{}");
+    let Input::Expr(value) = expr.input else {
+      panic!("expected expr input");
+    };
+    assert_eq!(value, "{}");
+    assert_eq!(expr.workers, Config::default().workers);
+
+    let file = Config::file("default.nix");
+    let Input::File(path) = file.input else {
+      panic!("expected file input");
+    };
+    assert_eq!(path, PathBuf::from("default.nix"));
+
+    let flake = Config::flake(".#checks");
+    let Input::Flake(reference) = flake.input else {
+      panic!("expected flake input");
+    };
+    assert_eq!(reference, ".#checks");
+  }
+
+  #[test]
+  fn config_builder_sets_library_options() {
+    let config = ConfigBuilder::flake(".#hydraJobs")
+      .workers(4)
+      .max_memory_size(1024)
+      .meta(true)
+      .show_input_drvs(true)
+      .force_recurse(true)
+      .gc_roots_dir("gcroots")
+      .auto_arg_expr("pkgs", "import <nixpkgs> {}")
+      .auto_arg_str("system", "x86_64-linux")
+      .override_input("nixpkgs", "github:NixOS/nixpkgs/nixos-unstable")
+      .nix_option("allow-import-from-derivation", "false")
+      .remote(Remote {
+        endpoint: "127.0.0.1:9000".into(),
+        systems:  vec!["x86_64-linux".into()],
+        workers:  2,
+      })
+      .build();
+
+    assert_eq!(config.workers, 4);
+    assert_eq!(config.max_memory_size, 1024);
+    assert!(config.meta);
+    assert!(config.show_input_drvs);
+    assert!(config.force_recurse);
+    assert_eq!(config.gc_roots_dir, Some(PathBuf::from("gcroots")));
+    assert_eq!(config.auto_args.len(), 2);
+    assert_eq!(config.override_inputs.len(), 1);
+    assert_eq!(config.nix_options.len(), 1);
+    assert_eq!(config.remotes.len(), 1);
+  }
 }

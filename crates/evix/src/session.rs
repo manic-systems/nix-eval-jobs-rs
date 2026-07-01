@@ -7,7 +7,7 @@ use std::{
   },
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result as AnyhowResult, anyhow};
 use futures_channel::mpsc as futures_mpsc;
 use futures_core::Stream;
 use tokio::sync::{Notify, RwLock};
@@ -17,8 +17,10 @@ use crate::{
   Config,
   Derivation,
   Diff,
+  Error,
   Event,
   Filter,
+  Result,
   run,
   state::{WarmState, diff_graphs, matches_filter},
   watch,
@@ -64,9 +66,7 @@ impl Session {
     let (tx, rx) = futures_mpsc::unbounded();
 
     if !self.start_initial_evaluation() {
-      let _ = tx.unbounded_send(Err(anyhow!(
-        "session stream has already been consumed"
-      )));
+      let _ = tx.unbounded_send(Err(Error::SessionStreamConsumed));
       return rx;
     }
 
@@ -99,7 +99,7 @@ impl Session {
         {
           let message = err.to_string();
           record_initial_error(&state, &completed, &initial, message).await;
-          let _ = tx.unbounded_send(Err(err));
+          let _ = tx.unbounded_send(Err(Error::from(err)));
         } else {
           finish_initial_evaluation(&initial);
         }
@@ -144,7 +144,7 @@ impl Session {
         {
           let message = err.to_string();
           record_initial_error(&state, &completed, &initial, message).await;
-          let _ = tx.unbounded_send(Err(err));
+          let _ = tx.unbounded_send(Err(Error::from(err)));
           return;
         } else if start_initial {
           finish_initial_evaluation(&initial);
@@ -153,7 +153,7 @@ impl Session {
         if let Err(err) =
           watch::watch_loop(config, cancel, state, completed, tx.clone()).await
         {
-          let _ = tx.unbounded_send(Err(err));
+          let _ = tx.unbounded_send(Err(Error::from(err)));
         }
       },
       spawn_state,
@@ -173,7 +173,9 @@ impl Session {
   ) -> Result<Vec<Derivation>> {
     let guard = self.state.read().await;
     if !guard.completed {
-      bail!("Session::query_snapshot requires a completed initial evaluation");
+      return Err(Error::InitialEvaluationIncomplete {
+        operation: "query_snapshot",
+      });
     }
     Ok(
       guard
@@ -195,7 +197,9 @@ impl Session {
     let previous = {
       let guard = self.state.read().await;
       if !guard.completed {
-        bail!("Session::diff_once requires a completed initial evaluation");
+        return Err(Error::InitialEvaluationIncomplete {
+          operation: "diff_once",
+        });
       }
       guard.graph.clone()
     };
@@ -217,15 +221,23 @@ impl Session {
     self.state.read().await.completed
   }
 
+  /// Request cancellation of this session's active evaluation or watch loop.
+  pub fn cancel(&self) {
+    self.cancel.store(true, Ordering::Relaxed);
+    self.completed.notify_waiters();
+  }
+
   pub async fn require_completed(&self) -> Result<()> {
     let state = self.state.read().await;
     if state.completed {
       return Ok(());
     }
     if let Some(error) = &state.error {
-      bail!("{error}");
+      return Err(Error::EvaluationFailed {
+        message: error.clone(),
+      });
     }
-    bail!("session is still evaluating")
+    Err(Error::SessionStillEvaluating)
   }
 
   fn start_initial_evaluation(&self) -> bool {
@@ -249,9 +261,9 @@ async fn evaluate_initial<F>(
   state: Arc<RwLock<WarmState>>,
   completed: Arc<Notify>,
   on_event: F,
-) -> Result<()>
+) -> AnyhowResult<()>
 where
-  F: FnMut(Event) -> Result<()> + Send + 'static,
+  F: FnMut(Event) -> AnyhowResult<()> + Send + 'static,
 {
   debug!("starting session evaluation");
   let result = run::evaluate(config, Arc::clone(&cancel), on_event).await;
@@ -312,20 +324,23 @@ fn spawn_session_task<T: Send + 'static>(
       }
       finish_initial_evaluation(&initial);
       completed.notify_waiters();
-      let _ = tx.unbounded_send(Err(anyhow!(message)));
+      let _ = tx.unbounded_send(Err(Error::RuntimeUnavailable {
+        message: message.into(),
+      }));
     },
   }
 }
 
 impl Drop for Session {
   fn drop(&mut self) {
-    self.cancel.store(true, Ordering::Relaxed);
-    self.completed.notify_waiters();
+    self.cancel();
   }
 }
 
 #[cfg(test)]
 mod tests {
+  use futures_util::StreamExt as _;
+
   use super::*;
 
   #[test]
@@ -358,5 +373,56 @@ mod tests {
         .as_deref(),
       Some("Session streams require an active Tokio runtime")
     );
+  }
+
+  #[test]
+  fn query_before_initial_eval_uses_matchable_error() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+
+    let error = runtime.block_on(async {
+      let session = Session::open(Config::default()).await.unwrap();
+      session.query_snapshot(Filter::default()).await.unwrap_err()
+    });
+
+    assert!(matches!(error, Error::InitialEvaluationIncomplete {
+      operation: "query_snapshot",
+    }));
+  }
+
+  #[test]
+  fn duplicate_stream_uses_matchable_error() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    let session = Session {
+      config:    Config::default(),
+      cancel:    Arc::new(AtomicBool::new(false)),
+      state:     Arc::new(RwLock::new(WarmState::default())),
+      completed: Arc::new(Notify::new()),
+      initial:   Arc::new(Mutex::new(InitialEvaluation::Finished)),
+    };
+    let mut stream = Box::pin(session.stream());
+
+    let error =
+      runtime.block_on(async { stream.next().await.unwrap().unwrap_err() });
+
+    assert!(matches!(error, Error::SessionStreamConsumed));
+  }
+
+  #[test]
+  fn cancel_sets_session_cancellation_flag() {
+    let session = Session {
+      config:    Config::default(),
+      cancel:    Arc::new(AtomicBool::new(false)),
+      state:     Arc::new(RwLock::new(WarmState::default())),
+      completed: Arc::new(Notify::new()),
+      initial:   Arc::new(Mutex::new(InitialEvaluation::Idle)),
+    };
+
+    session.cancel();
+
+    assert!(session.cancel.load(Ordering::Relaxed));
   }
 }

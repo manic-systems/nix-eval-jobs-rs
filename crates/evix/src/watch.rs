@@ -8,7 +8,7 @@ use std::{
   time::Duration,
 };
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result as AnyhowResult, anyhow, bail};
 use futures_channel::mpsc as futures_mpsc;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::{
@@ -19,6 +19,7 @@ use tokio::{
 use crate::{
   Config,
   Diff,
+  Error,
   Input,
   run,
   state::{WarmState, diff_graphs},
@@ -29,8 +30,8 @@ pub async fn watch_loop(
   cancel: Arc<AtomicBool>,
   state: Arc<RwLock<WarmState>>,
   completed: Arc<Notify>,
-  tx: futures_mpsc::UnboundedSender<Result<Diff>>,
-) -> Result<()> {
+  tx: futures_mpsc::UnboundedSender<crate::Result<Diff>>,
+) -> AnyhowResult<()> {
   wait_for_initial_evaluation(&cancel, &state, &completed).await?;
 
   let paths = watched_paths(&config)?;
@@ -72,8 +73,10 @@ pub async fn watch_loop(
           .map_err(|_| anyhow!("watch stream receiver was dropped"))?;
       },
       Ok(Some(Err(err))) => {
-        tx.unbounded_send(Err(anyhow!("filesystem watch error: {err}")))
-          .map_err(|_| anyhow!("watch stream receiver was dropped"))?;
+        tx.unbounded_send(Err(Error::from(anyhow!(
+          "filesystem watch error: {err}"
+        ))))
+        .map_err(|_| anyhow!("watch stream receiver was dropped"))?;
       },
       Ok(None) => bail!("filesystem watcher disconnected"),
       Err(_) => {},
@@ -87,7 +90,7 @@ async fn wait_for_initial_evaluation(
   cancel: &AtomicBool,
   state: &RwLock<WarmState>,
   completed: &Notify,
-) -> Result<()> {
+) -> AnyhowResult<()> {
   while !cancel.load(Ordering::Relaxed) {
     let notified = completed.notified();
     {
@@ -111,7 +114,7 @@ async fn debounce_watch_events(
   while watch_rx.try_recv().is_ok() {}
 }
 
-fn watched_paths(config: &Config) -> Result<Vec<PathBuf>> {
+fn watched_paths(config: &Config) -> AnyhowResult<Vec<PathBuf>> {
   match &config.input {
     Input::File(path) => Ok(vec![path.clone()]),
     Input::Expr(_) => bail!("watch requires a file or local flake input"),
@@ -119,7 +122,7 @@ fn watched_paths(config: &Config) -> Result<Vec<PathBuf>> {
   }
 }
 
-fn watched_flake_paths(reference: &str) -> Result<Vec<PathBuf>> {
+fn watched_flake_paths(reference: &str) -> AnyhowResult<Vec<PathBuf>> {
   let root = local_flake_root(reference).ok_or_else(|| {
     anyhow!("flake reference is not a local path: {reference}")
   })?;
@@ -150,7 +153,7 @@ fn local_flake_root(reference: &str) -> Option<PathBuf> {
   None
 }
 
-fn local_path_inputs(root: &Path) -> Result<Vec<PathBuf>> {
+fn local_path_inputs(root: &Path) -> AnyhowResult<Vec<PathBuf>> {
   let lock_path = root.join("flake.lock");
   let Ok(contents) = fs::read_to_string(&lock_path) else {
     return Ok(Vec::new());
