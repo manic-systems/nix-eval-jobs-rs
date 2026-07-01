@@ -383,6 +383,11 @@ async fn example() -> anyhow::Result<()> {
 calling `query_snapshot` or `diff_once`; `Session::watch` can start and drain
 the initial evaluation itself before emitting diffs.
 
+Use `Session::stream_bounded(capacity)` or `Session::watch_bounded(capacity)`
+when the embedding application needs backpressure. These variants keep at most
+`capacity` pending results, with `0` treated as `1`, and pause delivery while
+the receiver catches up.
+
 Serializing `evix::Event` directly with serde preserves the Rust enum shape,
 such as `{ "derivation": { ... } }` or `{ "attr_set": { ... } }`. Use
 `evix::json::event_value` or `evix::json::event_line` when you want the
